@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -20,9 +20,36 @@ from packages.connected.strategy_assessment import (
     assess_strategy,
 )
 from packages.database.models import AgentAPIKeyRecord, WorkspaceRecord
+from packages.domain.broker import BrokerAccount, BrokerSyncStatus
+from packages.domain.system import BrokerState
 from packages.security.agent_keys import generate_agent_key, hash_agent_key, key_prefix
 
 router = APIRouter(prefix="/desk", tags=["agent-integrations"])
+
+
+def _broker_evidence_is_ready(
+    status: BrokerSyncStatus,
+    account: BrokerAccount | None,
+    *,
+    now: datetime,
+    maximum_age: timedelta,
+) -> bool:
+    if (
+        status.state is not BrokerState.RECONCILED
+        or not status.stream_connected
+        or status.last_reconciled_at is None
+        or account is None
+        or account.environment.upper() != "PAPER"
+        or account.status.upper() != "ACTIVE"
+        or account.trading_blocked
+        or account.account_blocked
+        or account.trade_suspended_by_user
+    ):
+        return False
+    return all(
+        timedelta(0) <= now - timestamp <= maximum_age
+        for timestamp in (status.last_reconciled_at, account.as_of)
+    )
 
 
 class AgentKeyCreate(BaseModel):
@@ -192,14 +219,11 @@ async def strategy_assessment(
     status = await projections.get_status()
     account = await projections.get_account()
     now = datetime.now(UTC)
-    broker_ready = (
-        status.state.value == "RECONCILED"
-        and status.last_reconciled_at is not None
-        and (now - status.last_reconciled_at).total_seconds()
-        <= policy.execution_max_quote_age_seconds
-        and account is not None
-        and account.environment == "PAPER"
-        and (now - account.as_of).total_seconds() <= policy.execution_max_quote_age_seconds
+    broker_ready = _broker_evidence_is_ready(
+        status,
+        account,
+        now=now,
+        maximum_age=timedelta(seconds=policy.execution_max_quote_age_seconds),
     )
     return assess_strategy(
         payload,
