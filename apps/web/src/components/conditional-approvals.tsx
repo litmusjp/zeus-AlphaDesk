@@ -114,13 +114,13 @@ export function ConditionalApprovals() {
       <p style={{ fontSize: "12px", color: "#5a6864", margin: "4px 0 14px 0" }}>
         CLOSE approvals identify the exact contract and current position. They never substitute another QQQ contract.
       </p>
-      <section className="data-table">
-        <header style={{ gridTemplateColumns: "1.3fr .65fr 1.35fr .9fr 1.4fr 1.1fr .7fr" }}>
+      <section className="data-table conditional-approvals-table">
+        <header>
           <span>CONTRACT</span><span>ACTION</span><span>BOUND</span><span>QTY</span><span>NEXT SESSION / EXPIRY</span><span>STATE</span><span>ACTION</span>
         </header>
         {approvals.length ? approvals.map((approval) => {
           const canReject = approval.state === "APPROVED_FOR_SESSION";
-          return <div className="data-row" key={approval.approval_id} style={{ gridTemplateColumns: "1.3fr .65fr 1.35fr .9fr 1.4fr 1.1fr .7fr" }}>
+          return <div className="data-row" key={approval.approval_id}>
             <div><strong>{approval.symbol}</strong><small style={{ color: "#707d79", fontSize: "9px", display: "block" }}>{approval.approval_kind === "CLOSE" ? `Position ${approval.position_side ?? "—"} · ${approval.position_asset_id ?? "—"}` : approval.structure_fingerprint}</small></div>
             <span className={`status-pill ${approval.approval_kind === "CLOSE" ? "warn" : ""}`}>{approval.approval_kind}</span>
             <span>{bound(approval)}</span>
@@ -128,7 +128,7 @@ export function ConditionalApprovals() {
             <div><strong>{approval.session_date}</strong><small style={{ color: "#707d79", fontSize: "9px", display: "block" }}>{japanTime(approval.expires_at)} JST</small></div>
             <span className={`status-pill ${approval.state === "FILLED" ? "good" : ""}`}>{approval.state}</span>
             <div>{canReject ? <button className="secondary-button" style={{ fontSize: "10px", padding: "4px 7px" }} disabled={busy === approval.approval_id} onClick={() => reject(approval)}>{busy === approval.approval_id ? "…" : "Reject"}</button> : approval.broker_order_id ? <code style={{ fontSize: "9px" }}>{approval.broker_order_id.slice(0, 10)}…</code> : <Clock size={14} />}</div>
-            {approval.failure_reason ? <small style={{ gridColumn: "1 / -1", color: "#a8372c" }}>Reason: {approval.failure_reason}</small> : null}
+            {approval.failure_reason ? <small className="failure-reason" style={{ gridColumn: "1 / -1", color: "#a8372c" }}>Reason: {approval.failure_reason}</small> : null}
           </div>;
         }) : <div className="table-empty"><CheckCircle2 /><strong>No conditional approvals</strong><p>Pre-scan approvals and next-session position closes will appear here.</p></div>}
       </section>

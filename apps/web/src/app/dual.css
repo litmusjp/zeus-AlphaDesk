@@ -161,3 +161,7 @@
   .guardian-guide-grid{grid-template-columns:1fr}
 }
 
+.conditional-approvals-table>header,.conditional-approvals-table>.data-row{grid-template-columns:minmax(0,1.3fr) minmax(0,.65fr) minmax(0,1.35fr) minmax(0,.9fr) minmax(0,1.4fr) minmax(0,1.1fr) minmax(0,.7fr)}
+.conditional-approvals-table>.data-row>*{min-width:0}
+.conditional-approvals-table>.data-row>.failure-reason{overflow-wrap:anywhere}
+
