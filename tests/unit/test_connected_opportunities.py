@@ -16,6 +16,7 @@ from packages.connected.opportunities import (
     _strategy_for_mode,
 )
 from packages.connected.option_scan_policy import OptionScanDiagnostics, ScanMode
+from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import CatalystFeatures, Signal
 from packages.options.alpaca_adapter import OptionChainFetchDiagnostics
 from packages.strategy.catalyst import score_signal
@@ -168,6 +169,7 @@ async def test_pre_scan_gate_unavailable_is_candidate_without_order_intent(
     service._sessions = SimpleNamespace()
     service._workspace_id = uuid4()
     service._policy = AssessmentPolicy()
+    service._environment = TradingEnvironment.LIVE
     service._options = SimpleNamespace(
         get_chain_with_diagnostics=lambda _query: None,
     )
@@ -188,7 +190,7 @@ async def test_pre_scan_gate_unavailable_is_candidate_without_order_intent(
 
     class ProjectionStore:
         def __init__(self, *_args: Any) -> None:
-            pass
+            assert _args[-1] is TradingEnvironment.LIVE
 
         async def get_account(self) -> Any:
             return SimpleNamespace(equity=Decimal("100000"), last_equity=Decimal("100000"))
@@ -197,8 +199,8 @@ async def test_pre_scan_gate_unavailable_is_candidate_without_order_intent(
             return []
 
     class Gate:
-        def __init__(self, *_args: Any) -> None:
-            pass
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            assert kwargs["environment"] is TradingEnvironment.LIVE
 
         async def evaluate(self, _now: Any) -> Any:
             return SimpleNamespace(allowed=False, reason="Broker reconciliation is stale.")

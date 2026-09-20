@@ -294,6 +294,7 @@ async def process_workspace_approvals(
                 str(secret["api_key_id"]),
                 str(secret["secret_key"]),
                 policy=AssessmentPolicy.from_payload(workspace_policy or {}),
+                environment=environment,
             )
             fresh = await service.analyze(
                 original.symbol,

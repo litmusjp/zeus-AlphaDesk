@@ -20,6 +20,7 @@ from packages.connected.assessment_policy import AssessmentPolicy, position_expo
 from packages.connected.option_scan_policy import ScanMode, select_contracts
 from packages.database.models import ConnectedOpportunityRecord, ConnectedScanRunRecord
 from packages.domain.options import LegSide, OptionLeg, OptionType, StructureType
+from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import CatalystFeatures, NoTrade, OrderIntent, RankedCandidate, Signal
 from packages.execution.intents import create_order_intent
 from packages.options.alpaca_adapter import (
@@ -155,6 +156,7 @@ class ConnectedOpportunityService:
         api_key: str,
         secret_key: str,
         policy: AssessmentPolicy | None = None,
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
     ) -> None:
         self._sessions = sessions
         self._workspace_id = workspace_id
@@ -162,6 +164,7 @@ class ConnectedOpportunityService:
         self._news = NewsClient(api_key, secret_key)
         self._options = AlpacaOptionChainAdapter(api_key, secret_key)
         self._policy = policy or AssessmentPolicy()
+        self._environment = environment
 
     @property
     def policy(self) -> AssessmentPolicy:
@@ -417,9 +420,13 @@ class ConnectedOpportunityService:
             and short_contract.contract_id in strict_contract_ids
         )
         candidate = strategy.rank_candidates(idea, (structure,))[0]
-        projections = PostgresBrokerProjectionStore(self._sessions, self._workspace_id)
+        projections = PostgresBrokerProjectionStore(
+            self._sessions, self._workspace_id, self._environment
+        )
         account = await projections.get_account()
-        gate = await BrokerExecutionGate(projections).evaluate(now)
+        gate = await BrokerExecutionGate(
+            projections, environment=self._environment
+        ).evaluate(now)
         if account is None:
             return await self._unavailable(
                 opportunity_id,

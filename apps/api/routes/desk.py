@@ -1000,6 +1000,7 @@ async def _opportunity_service(
         str(secrets["api_key_id"]),
         str(secrets["secret_key"]),
         policy=policy,
+        environment=environment,
     )
 
 
