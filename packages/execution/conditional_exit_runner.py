@@ -8,10 +8,11 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from packages.broker.adapter import BrokerPreflightFailed
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
 from packages.connected.market_clock import AlpacaMarketClockAdapter
-from packages.database.models import ConditionalApprovalRecord
+from packages.database.models import ConditionalApprovalRecord, WorkspaceRecord
 from packages.database.session import Database
+from packages.domain.system import TradingEnvironment
 from packages.execution.conditional_approval import (
     ApprovalState,
     ConditionalExitApproval,
@@ -151,7 +152,13 @@ async def process_workspace_exit_approvals(
     await _recover_ready_to_submit(database, store, cipher, workspace_id)
     await store.expire_before(workspace_id=workspace_id, now=now)
     session_date = now.astimezone(ZoneInfo("America/New_York")).date()
-    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")
+    async with database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
     if secret is None:
         return
 
@@ -194,6 +201,7 @@ async def process_workspace_exit_approvals(
                 secret=secret,
                 record=record,
                 workspace_id=workspace_id,
+                environment=environment,
                 session_date=session_date,
                 now=now,
                 submission_started=submission_started,
@@ -232,6 +240,7 @@ async def _process_claimed_exit(
     secret: dict[str, object],
     record: ConditionalApprovalRecord,
     workspace_id: UUID,
+    environment: TradingEnvironment,
     session_date: date,
     now: datetime,
     submission_started: list[bool],
@@ -284,7 +293,9 @@ async def _process_claimed_exit(
         )
         return
 
-    broker = AlpacaPaperBrokerAdapter(str(secret["api_key_id"]), str(secret["secret_key"]))
+    broker = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
     try:
         try:
             existing = await broker.get_order(client_order_id=record.client_order_id)
@@ -458,7 +469,9 @@ async def _process_claimed_exit(
         )
         return
 
-    broker = AlpacaPaperBrokerAdapter(str(secret["api_key_id"]), str(secret["secret_key"]))
+    broker = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
     order = None
     try:
         try:
@@ -677,10 +690,18 @@ async def _recover_ready_to_submit(
     )
     if not records:
         return
-    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")
+    async with database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
     if secret is None:
         return
-    broker = AlpacaPaperBrokerAdapter(str(secret["api_key_id"]), str(secret["secret_key"]))
+    broker = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
     try:
         for record in records:
             now = datetime.now(UTC)

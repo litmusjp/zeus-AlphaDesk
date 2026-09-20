@@ -7,6 +7,8 @@ from typing import Any
 from alpaca.trading.client import TradingClient
 from pydantic import BaseModel, ConfigDict
 
+from packages.domain.system import TradingEnvironment
+
 
 class ConnectedMarketClock(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -30,10 +32,19 @@ def _aware(value: Any) -> datetime:
 class AlpacaMarketClockAdapter:
     """Read-only tenant-bound Alpaca market clock boundary."""
 
-    def __init__(self, api_key: str, secret_key: str, *, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        *,
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
+        client: Any | None = None,
+    ) -> None:
         if not api_key or not secret_key:
             raise ValueError("Alpaca credentials are required for the market clock")
-        self._client = client or TradingClient(api_key, secret_key, paper=True)
+        self._client = client or TradingClient(
+            api_key, secret_key, paper=environment is TradingEnvironment.PAPER
+        )
 
     async def get_clock(self) -> ConnectedMarketClock:
         raw = await asyncio.to_thread(self._client.get_clock)

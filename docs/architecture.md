@@ -31,7 +31,7 @@ flowchart TB
 - Supabase's server secret is available only to the API. The worker receives an explicit empty override and the browser receives only public Supabase configuration.
 - The worker decrypts a credential only in memory and supervises each workspace independently.
 - Manual and scheduled scans create workspace-scoped scan-run records. Opportunity rows retain real-source timestamps and provenance.
-- Only the Execution Engine submits orders. Every paper order requires a fresh explicit confirmation and is reconciled by stable client-order ID.
+- Only the Execution Engine submits orders. Every order is bound to the persisted PAPER/LIVE environment, matching account and credentials, stable client-order ID, immutable approval, Guardian, reconciliation, and submission-fencing checks. LIVE is two-phase: an admin may prepare a separately verified target while remaining PAPER, then Enable LIVE revalidates fresh preparation and confirmation. The persisted LIVE worker must independently establish trade-updates and reconciliation readiness before execution; preparation never fakes stream connectivity.
 - PostgreSQL and NATS have no published ports in the Lightsail Compose file. Caddy is the only public ingress.
 
 The historical demo-session migration and model are retained so existing databases are not altered destructively; they are not reachable through the application runtime.

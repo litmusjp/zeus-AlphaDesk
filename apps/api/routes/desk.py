@@ -32,7 +32,7 @@ from packages.ai.watchlist import (
 )
 from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter, AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
@@ -61,7 +61,7 @@ from packages.database.models import (
 from packages.domain.ai import AIWorkflowResult, Citation
 from packages.domain.broker import BrokerAccount, BrokerOrder, BrokerPosition, BrokerSyncStatus
 from packages.domain.guardian import GuardianStatus, GuardianTrigger
-from packages.domain.system import BrokerState
+from packages.domain.system import BrokerState, TradingEnvironment
 from packages.domain.workflow import OrderIntent, RankedCandidate, RiskDecision, RiskDecisionValue
 from packages.execution.conditional_approval import (
     ApprovalState,
@@ -77,6 +77,7 @@ from packages.execution.intents import create_order_intent
 from packages.guardian.store import PostgresGuardianStore
 from packages.observability.logging import get_logger
 from packages.security.store import CredentialStore
+from packages.trading.environment import LIVE_CONFIRMATION_PHRASE
 
 router = APIRouter(prefix="/desk", tags=["connected-paper"])
 logger = get_logger(__name__)
@@ -87,6 +88,7 @@ class WorkspaceView(BaseModel):
 
     workspace_id: UUID
     mode: Literal["CONNECTED_PAPER"] = "CONNECTED_PAPER"
+    trading_environment: TradingEnvironment
     status: str
     scanner_enabled: bool
     watchlist_count: int
@@ -120,6 +122,10 @@ class AlpacaCredentialInput(BaseModel):
 
     api_key_id: SecretStr = Field(min_length=8)
     secret_key: SecretStr = Field(min_length=8)
+
+
+ALPACA_PAPER_PROVIDER = "ALPACA_PAPER"
+ALPACA_LIVE_PROVIDER = "ALPACA_LIVE"
 
 
 class OpenRouterCredentialInput(BaseModel):
@@ -233,6 +239,7 @@ class ConditionalApprovalInput(BaseModel):
     max_loss: Decimal | None = Field(default=None, gt=0)
     max_quantity: int | None = Field(default=None, ge=1, le=100)
     max_quote_age_seconds: int = Field(default=30, ge=1, le=300)
+    live_order_confirmation: str | None = None
 
 
 class ConditionalExitApprovalInput(BaseModel):
@@ -274,6 +281,30 @@ def _credential_store(request: Request) -> CredentialStore:
             status_code=503, detail="Encrypted credential storage is not configured"
         )
     return CredentialStore(request.app.state.database.sessions, cipher)
+
+
+async def _workspace_environment(
+    request: Request, workspace_id: UUID
+) -> TradingEnvironment:
+    sessions = request.app.state.database.sessions
+    if not callable(sessions):
+        # Unit-level request doubles from the paper-only close path predate the
+        # persisted environment. Production sessions are always callable.
+        return TradingEnvironment.PAPER
+    async with sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    try:
+        return TradingEnvironment(workspace.trading_environment)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=409, detail="Workspace trading environment is invalid"
+        ) from error
+
+
+def _alpaca_provider(environment: TradingEnvironment) -> str:
+    return ALPACA_LIVE_PROVIDER if environment is TradingEnvironment.LIVE else ALPACA_PAPER_PROVIDER
 
 
 def _credential_view(
@@ -348,6 +379,7 @@ async def workspace_view(
     return WorkspaceView(
         workspace_id=context.workspace_id,
         status=workspace.status,
+        trading_environment=TradingEnvironment(workspace.trading_environment),
         scanner_enabled=workspace.scanner_enabled,
         watchlist_count=watchlist_count,
     )
@@ -464,20 +496,32 @@ async def credential_statuses(
         }
     return [
         _credential_view(provider, records.get(provider))
-        for provider in ("ALPACA", "OPENROUTER", "ANTHROPIC")
+        for provider in (ALPACA_PAPER_PROVIDER, ALPACA_LIVE_PROVIDER, "OPENROUTER", "ANTHROPIC")
     ]
 
 
-async def _test_alpaca(payload: AlpacaCredentialInput) -> ProviderTestResult:
-    adapter = AlpacaPaperBrokerAdapter(
-        payload.api_key_id.get_secret_value(), payload.secret_key.get_secret_value()
+async def _test_alpaca(
+    payload: AlpacaCredentialInput, environment: TradingEnvironment
+) -> ProviderTestResult:
+    provider = (
+        ALPACA_LIVE_PROVIDER
+        if environment is TradingEnvironment.LIVE
+        else ALPACA_PAPER_PROVIDER
+    )
+    adapter = AlpacaBrokerAdapter(
+        payload.api_key_id.get_secret_value(),
+        payload.secret_key.get_secret_value(),
+        environment=environment,
     )
     try:
         snapshot = await asyncio.wait_for(adapter.reconcile(), timeout=20)
         return ProviderTestResult(
-            provider="ALPACA",
+            provider=provider,
             status="VERIFIED",
-            detail="Paper endpoint authenticated; account, positions, and orders reconciled.",
+            detail=(
+                f"Alpaca {environment.value.lower()} endpoint authenticated; account, "
+                "positions, and orders reconciled."
+            ),
             account_status=snapshot.account.status,
         )
     except Exception as error:
@@ -494,7 +538,7 @@ async def test_alpaca_credentials(
     payload: AlpacaCredentialInput,
     _: WorkspaceContext = Depends(require_workspace),
 ) -> ProviderTestResult:
-    return await _test_alpaca(payload)
+    return await _test_alpaca(payload, TradingEnvironment.PAPER)
 
 
 @router.put("/credentials/alpaca", response_model=CredentialStatusView)
@@ -503,16 +547,16 @@ async def save_alpaca_credentials(
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> CredentialStatusView:
-    await _test_alpaca(payload)
+    await _test_alpaca(payload, TradingEnvironment.PAPER)
     record = await _credential_store(request).save(
         workspace_id=context.workspace_id,
         actor_user_id=context.principal.user_id,
-        provider="ALPACA",
+        provider=ALPACA_PAPER_PROVIDER,
         secret_payload={
             "api_key_id": payload.api_key_id.get_secret_value(),
             "secret_key": payload.secret_key.get_secret_value(),
         },
-        configuration={"endpoint": "PAPER"},
+        configuration={"endpoint": TradingEnvironment.PAPER.value},
         validation_status="VERIFIED",
         enabled=True,
     )
@@ -521,7 +565,37 @@ async def save_alpaca_credentials(
         assert workspace is not None
         workspace.status = "CONNECTING"
         workspace.updated_at = datetime.now(UTC)
-    return _credential_view("ALPACA", record)
+    return _credential_view(ALPACA_PAPER_PROVIDER, record)
+
+
+@router.post("/credentials/alpaca-live/test", response_model=ProviderTestResult)
+async def test_alpaca_live_credentials(
+    payload: AlpacaCredentialInput,
+    _: WorkspaceContext = Depends(require_workspace),
+) -> ProviderTestResult:
+    return await _test_alpaca(payload, TradingEnvironment.LIVE)
+
+
+@router.put("/credentials/alpaca-live", response_model=CredentialStatusView)
+async def save_alpaca_live_credentials(
+    payload: AlpacaCredentialInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> CredentialStatusView:
+    await _test_alpaca(payload, TradingEnvironment.LIVE)
+    record = await _credential_store(request).save(
+        workspace_id=context.workspace_id,
+        actor_user_id=context.principal.user_id,
+        provider=ALPACA_LIVE_PROVIDER,
+        secret_payload={
+            "api_key_id": payload.api_key_id.get_secret_value(),
+            "secret_key": payload.secret_key.get_secret_value(),
+        },
+        configuration={"endpoint": TradingEnvironment.LIVE.value},
+        validation_status="VERIFIED",
+        enabled=True,
+    )
+    return _credential_view(ALPACA_LIVE_PROVIDER, record)
 
 
 async def _test_openrouter(payload: OpenRouterCredentialInput) -> ProviderTestResult:
@@ -646,17 +720,19 @@ async def save_anthropic_credentials(
 
 @router.delete("/credentials/{provider}", status_code=204)
 async def delete_credentials(
-    provider: Literal["alpaca", "openrouter", "anthropic"],
+    provider: Literal["alpaca", "alpaca-live", "openrouter", "anthropic"],
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> None:
-    normalized = provider.upper()
+    normalized = ALPACA_LIVE_PROVIDER if provider == "alpaca-live" else (
+        ALPACA_PAPER_PROVIDER if provider == "alpaca" else provider.upper()
+    )
     await _credential_store(request).delete(
         workspace_id=context.workspace_id,
         actor_user_id=context.principal.user_id,
         provider=normalized,
     )
-    if normalized == "ALPACA":
+    if normalized in {ALPACA_PAPER_PROVIDER, "ALPACA"}:
         async with request.app.state.database.sessions.begin() as session:
             for model in (
                 BrokerOrderRecord,
@@ -831,10 +907,13 @@ async def set_scanner(
     context: WorkspaceContext = Depends(require_workspace),
 ) -> WorkspaceView:
     if payload.enabled:
-        credential = await _credential_store(request).get(context.workspace_id, "ALPACA")
+        environment = await _workspace_environment(request, context.workspace_id)
+        credential = await _credential_store(request).get(
+            context.workspace_id, _alpaca_provider(environment)
+        )
         if credential is None or not credential.enabled:
             raise HTTPException(
-                status_code=409, detail="Verified Alpaca paper credentials required"
+                status_code=409, detail="Verified target Alpaca credentials required"
             )
     async with request.app.state.database.sessions.begin() as session:
         workspace = await session.get(WorkspaceRecord, context.workspace_id, with_for_update=True)
@@ -853,6 +932,7 @@ async def set_scanner(
         return WorkspaceView(
             workspace_id=workspace.workspace_id,
             status=workspace.status,
+            trading_environment=TradingEnvironment(workspace.trading_environment),
             scanner_enabled=workspace.scanner_enabled,
             watchlist_count=count,
         )
@@ -861,9 +941,12 @@ async def set_scanner(
 async def _opportunity_service(
     request: Request, context: WorkspaceContext
 ) -> ConnectedOpportunityService:
-    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    environment = await _workspace_environment(request, context.workspace_id)
+    secrets = await _credential_store(request).reveal(
+        context.workspace_id, _alpaca_provider(environment)
+    )
     if secrets is None:
-        raise HTTPException(status_code=409, detail="Verified Alpaca paper credentials required")
+        raise HTTPException(status_code=409, detail="Verified target Alpaca credentials required")
     async with request.app.state.database.sessions() as session:
         workspace = await session.get(WorkspaceRecord, context.workspace_id)
         if workspace is None:
@@ -883,12 +966,17 @@ async def market_clock(
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> ConnectedMarketClock:
-    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    environment = await _workspace_environment(request, context.workspace_id)
+    secrets = await _credential_store(request).reveal(
+        context.workspace_id, _alpaca_provider(environment)
+    )
     if secrets is None:
-        raise HTTPException(status_code=409, detail="Verified Alpaca paper credentials required")
+        raise HTTPException(status_code=409, detail="Verified target Alpaca credentials required")
     try:
         return await AlpacaMarketClockAdapter(
-            str(secrets["api_key_id"]), str(secrets["secret_key"])
+            str(secrets["api_key_id"]),
+            str(secrets["secret_key"]),
+            environment=environment,
         ).get_clock()
     except Exception as error:
         raise HTTPException(
@@ -1472,10 +1560,15 @@ async def get_opportunity(
 async def _next_session_window(
     request: Request, context: WorkspaceContext
 ) -> tuple[date, datetime]:
-    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    environment = await _workspace_environment(request, context.workspace_id)
+    secrets = await _credential_store(request).reveal(
+        context.workspace_id, _alpaca_provider(environment)
+    )
     if secrets is None:
-        raise HTTPException(status_code=409, detail="Verified Alpaca paper credentials required")
-    adapter = AlpacaMarketClockAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
+        raise HTTPException(status_code=409, detail="Verified target Alpaca credentials required")
+    adapter = AlpacaMarketClockAdapter(
+        str(secrets["api_key_id"]), str(secrets["secret_key"]), environment=environment
+    )
     try:
         clock = await adapter.get_clock()
     except Exception as error:
@@ -1556,6 +1649,9 @@ async def approve_for_next_session(
         if opportunity_record is None:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
+        workspace = await session.get(WorkspaceRecord, context.workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="Workspace not found")
         if opportunity_record.expires_at <= now or opportunity.expires_at <= now:
             raise HTTPException(
                 status_code=409, detail="Opportunity expired; analyze the symbol again"
@@ -1592,10 +1688,23 @@ async def approve_for_next_session(
         broker_account = await session.scalar(
             select(BrokerAccountRecord).where(
                 BrokerAccountRecord.workspace_id == context.workspace_id,
+                BrokerAccountRecord.environment == workspace.trading_environment,
             )
         )
         if broker_account is None:
-            raise HTTPException(status_code=409, detail="Paper broker account is not reconciled")
+            raise HTTPException(status_code=409, detail="Target broker account is not reconciled")
+        live_confirmation = None
+        if workspace.trading_environment == TradingEnvironment.LIVE.value:
+            if payload.live_order_confirmation != LIVE_CONFIRMATION_PHRASE:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Explicit first-live-order confirmation is required",
+                )
+            live_confirmation = {
+                "client_order_id": intent.client_order_id,
+                "broker_account_id": broker_account.account_id,
+                "environment": TradingEnvironment.LIVE.value,
+            }
         max_limit_price = payload.max_limit_price or intent.limit_price
         max_loss = payload.max_loss or candidate.structure.max_loss
         max_quantity = payload.max_quantity or intent.quantity
@@ -1644,6 +1753,8 @@ async def approve_for_next_session(
             record.approved_intent_payload = intent.model_dump(mode="json")
             record.approved_structure_identity = candidate_structure_identity(candidate)
             record.approved_broker_account_id = broker_account.account_id
+            record.execution_environment = workspace.trading_environment
+            record.live_order_confirmation = live_confirmation
             record.max_limit_price = max_limit_price
             record.max_loss = max_loss
             record.max_quantity = max_quantity
@@ -1671,6 +1782,8 @@ async def approve_for_next_session(
                 approved_intent_payload=intent.model_dump(mode="json"),
                 approved_structure_identity=candidate_structure_identity(candidate),
                 approved_broker_account_id=broker_account.account_id,
+                execution_environment=workspace.trading_environment,
+                live_order_confirmation=live_confirmation,
                 max_limit_price=max_limit_price,
                 max_loss=max_loss,
                 max_quantity=max_quantity,
@@ -1718,10 +1831,23 @@ async def approve_position_close_for_next_session(
     context: WorkspaceContext = Depends(require_workspace),
 ) -> ConditionalApprovalView:
     session_date, expires_at = await _next_session_window(request, context)
-    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    environment = await _workspace_environment(request, context.workspace_id)
+    secrets = await _credential_store(request).reveal(
+        context.workspace_id, _alpaca_provider(environment)
+    )
     if secrets is None:
         raise HTTPException(status_code=409, detail="Alpaca credential unavailable")
-    adapter = AlpacaPaperBrokerAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
+    adapter = (
+        AlpacaPaperBrokerAdapter(
+            str(secrets["api_key_id"]), str(secrets["secret_key"])
+        )
+        if environment is TradingEnvironment.PAPER
+        else AlpacaBrokerAdapter(
+            str(secrets["api_key_id"]),
+            str(secrets["secret_key"]),
+            environment=environment,
+        )
+    )
     try:
         snapshot = await adapter.reconcile()
     except Exception as error:

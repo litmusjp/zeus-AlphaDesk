@@ -5,7 +5,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
 from packages.connected.assessment_policy import AssessmentPolicy, position_exposure
@@ -13,6 +13,7 @@ from packages.connected.market_clock import AlpacaMarketClockAdapter
 from packages.database.models import ConditionalApprovalRecord, WorkspaceRecord
 from packages.database.session import Database
 from packages.domain.broker import BrokerOrder
+from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import OrderIntent, RankedCandidate
 from packages.execution.conditional_approval import (
     ApprovalState,
@@ -42,26 +43,22 @@ async def execute_connected_paper_order(
     claim_token: UUID,
     submission_token: UUID,
 ) -> BrokerOrder:
-    try:
-        return await _execute_connected_paper_order(
-            database=database,
-            cipher=cipher,
-            workspace_id=workspace_id,
-            candidate=candidate,
-            intent=intent,
-            approved_broker_account_id=approved_broker_account_id,
-            policy=policy,
-            approval_id=approval_id,
-            claim_token=claim_token,
-            submission_token=submission_token,
-        )
-    except (ExecutionBlocked, SubmissionUncertain):
-        raise
-    except Exception as error:
-        raise ExecutionBlocked("pre-submit execution preparation failed") from error
+    return await execute_connected_order(
+        database=database,
+        cipher=cipher,
+        workspace_id=workspace_id,
+        candidate=candidate,
+        intent=intent,
+        approved_broker_account_id=approved_broker_account_id,
+        policy=policy,
+        approval_id=approval_id,
+        claim_token=claim_token,
+        submission_token=submission_token,
+        environment=TradingEnvironment.PAPER,
+    )
 
 
-async def _execute_connected_paper_order(
+async def execute_connected_order(
     *,
     database: Database,
     cipher: CredentialCipher,
@@ -73,6 +70,41 @@ async def _execute_connected_paper_order(
     approval_id: UUID,
     claim_token: UUID,
     submission_token: UUID,
+    environment: TradingEnvironment,
+) -> BrokerOrder:
+    try:
+        return await _execute_connected_order(
+            database=database,
+            cipher=cipher,
+            workspace_id=workspace_id,
+            candidate=candidate,
+            intent=intent,
+            approved_broker_account_id=approved_broker_account_id,
+            policy=policy,
+            approval_id=approval_id,
+            claim_token=claim_token,
+            submission_token=submission_token,
+            environment=environment,
+        )
+    except (ExecutionBlocked, SubmissionUncertain):
+        raise
+    except Exception as error:
+        raise ExecutionBlocked("pre-submit execution preparation failed") from error
+
+
+async def _execute_connected_order(
+    *,
+    database: Database,
+    cipher: CredentialCipher,
+    workspace_id: UUID,
+    candidate: RankedCandidate,
+    intent: OrderIntent,
+    approved_broker_account_id: str | None = None,
+    policy: AssessmentPolicy,
+    approval_id: UUID,
+    claim_token: UUID,
+    submission_token: UUID,
+    environment: TradingEnvironment,
 ) -> BrokerOrder:
     async with database.sessions() as session:
         workspace = await session.get(WorkspaceRecord, workspace_id)
@@ -104,6 +136,7 @@ async def _execute_connected_paper_order(
         workspace is None
         or approval is None
         or approval.approval_kind != "OPEN"
+        or approval.execution_environment != environment.value
         or other_pending_approvals
         or approval.state != ApprovalState.SUBMITTING
         or approval.approved_broker_account_id is None
@@ -116,15 +149,25 @@ async def _execute_connected_paper_order(
         or intent.limit_price > approval.max_limit_price
         or candidate.structure.max_loss > approval.max_loss
         or workspace.updated_at > approval.approved_at
+        or workspace.trading_environment != environment.value
+        or (
+            environment is TradingEnvironment.LIVE
+            and approval.live_order_confirmation
+            != {
+                "client_order_id": intent.client_order_id,
+                "broker_account_id": approved_broker_account_id,
+                "environment": TradingEnvironment.LIVE.value,
+            }
+        )
     ):
         raise ExecutionBlocked("Approval is no longer valid for submission")
     policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
-    projections = PostgresBrokerProjectionStore(database.sessions, workspace_id)
+    projections = PostgresBrokerProjectionStore(database.sessions, workspace_id, environment)
     account = await projections.get_account()
     if account is None:
         raise ExecutionBlocked("Broker account projection unavailable")
-    if account.environment != "PAPER":
-        raise ExecutionBlocked("Broker account environment is not PAPER")
+    if account.environment != environment.value:
+        raise ExecutionBlocked("Broker account environment does not match workspace")
     if approved_broker_account_id is not None and account.account_id != approved_broker_account_id:
         raise ExecutionBlocked("Broker account changed since approval")
     if (
@@ -139,14 +182,14 @@ async def _execute_connected_paper_order(
     if any(
         position.identity_validated_at is None
         or position.broker_account_id != account.account_id
-        or position.environment != "PAPER"
+        or position.environment != environment.value
         for position in positions
     ):
         raise ExecutionBlocked("Broker position identity is unavailable or mismatched")
     if any(
         order.identity_validated_at is None
         or order.broker_account_id != account.account_id
-        or order.environment != "PAPER"
+        or order.environment != environment.value
         for order in orders
     ):
         raise ExecutionBlocked("Broker order identity is unavailable or mismatched")
@@ -178,7 +221,7 @@ async def _execute_connected_paper_order(
     open_planned_loss, underlying_open_risk, portfolio_greeks_available = position_exposure(
         positions, underlying_symbol, account.equity
     )
-    broker_gate = BrokerExecutionGate(projections)
+    broker_gate = BrokerExecutionGate(projections, environment=environment)
     gate = await broker_gate.evaluate()
     rerisk = RiskEngine(policy.as_risk_policy()).evaluate(
         candidate,
@@ -199,16 +242,17 @@ async def _execute_connected_paper_order(
     )
     if rerisk.decision != "APPROVE":
         raise ExecutionBlocked("Deterministic risk no longer approves this order")
-    secrets = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secrets = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
     if secrets is None:
         raise ExecutionBlocked("Alpaca credential unavailable")
     api_key = str(secrets["api_key_id"])
     secret_key = str(secrets["secret_key"])
-    adapter = AlpacaPaperBrokerAdapter(api_key, secret_key)
+    adapter = AlpacaBrokerAdapter(api_key, secret_key, environment=environment)
     try:
         authenticated_account = await adapter.get_account()
     except Exception as error:
-        raise ExecutionBlocked("Authenticated paper account unavailable") from error
+        raise ExecutionBlocked("Authenticated target account unavailable") from error
     if (
         authenticated_account.account_id != account.account_id
         or (
@@ -222,9 +266,11 @@ async def _execute_connected_paper_order(
     ):
         raise ExecutionBlocked("Authenticated paper account changed or unavailable")
     try:
-        market_clock = await AlpacaMarketClockAdapter(api_key, secret_key).get_clock()
+        market_clock = await AlpacaMarketClockAdapter(
+            api_key, secret_key, environment=environment
+        ).get_clock()
     except Exception as error:
-        raise ExecutionBlocked("Authoritative paper market clock unavailable") from error
+        raise ExecutionBlocked("Authoritative target market clock unavailable") from error
     if not market_clock.is_open:
         raise ExecutionBlocked("Market session is closed")
     guardian = PostgresGuardianStore(database.sessions, workspace_id)
@@ -238,6 +284,7 @@ async def _execute_connected_paper_order(
             approval_id=approval_id,
             submission_token=submission_token,
         ),
+        environment=environment,
     )
     order: BrokerOrder | None = None
     try:

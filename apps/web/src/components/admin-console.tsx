@@ -19,17 +19,59 @@ type ProvisionedWorkspace = {
   watchlist_count: number;
 };
 
+type TradingEnvironment = { environment: "PAPER" | "LIVE"; live_confirmation_phrase: string; dangerous_warning: string; preparation_state?: string | null; prepared_at?: string | null; target_account_id?: string | null };
+
 export function AdminConsole() {
   const [identity, setIdentity] = useState<IdentityView | null>(null);
   const [workspace, setWorkspace] = useState<ProvisionedWorkspace | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [tradingEnvironment, setTradingEnvironment] = useState<TradingEnvironment | null>(null);
+  const [confirmation, setConfirmation] = useState("");
 
   useEffect(() => {
     deskFetch<IdentityView>("/identity/me")
       .then(setIdentity)
       .catch((error: Error) => setMessage(error.message));
   }, []);
+
+  useEffect(() => {
+    if (identity?.is_admin && identity.workspace_id) {
+      void deskFetch<TradingEnvironment>("/admin/workspace/trading-environment")
+        .then(setTradingEnvironment)
+        .catch((error: Error) => setMessage(error.message));
+    }
+  }, [identity]);
+
+  async function changeEnvironment(environment: "PAPER" | "LIVE") {
+    setBusy(true);
+    try {
+      const result = await deskFetch<TradingEnvironment>("/admin/workspace/trading-environment", {
+        method: "PUT",
+        body: JSON.stringify({ environment, confirmation: environment === "LIVE" ? confirmation : null }),
+      });
+      setTradingEnvironment(result);
+      setConfirmation("");
+      setMessage(`Trading environment is now ${result.environment}.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Trading environment change failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function prepareLive() {
+    setBusy(true);
+    try {
+      const result = await deskFetch<TradingEnvironment>("/admin/workspace/trading-environment/prepare-live", { method: "POST" });
+      setTradingEnvironment(result);
+      setMessage("LIVE target prepared. The workspace remains PAPER and no orders were created.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "LIVE preparation failed closed");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function provision() {
     setBusy(true);
@@ -81,6 +123,15 @@ export function AdminConsole() {
         {message ? <p className="form-message" role="status">{message}</p> : null}
       </section>
       <section className="admin-console-section" aria-labelledby="credential-settings-heading">
+        {tradingEnvironment ? <section className="control-panel" aria-labelledby="trading-environment-heading">
+          <h2 id="trading-environment-heading">Trading environment</h2>
+          <p className={tradingEnvironment.environment === "LIVE" ? "mode-banner danger" : "mode-banner blue"}>
+            {tradingEnvironment.environment === "LIVE" ? tradingEnvironment.dangerous_warning : tradingEnvironment.preparation_state === "PREPARED" ? "LIVE target prepared only. PAPER remains active; the worker must establish its own live stream before execution." : "PAPER is the default and remains off for live trading."}
+          </p>
+          <div className="button-row"><button disabled={busy || tradingEnvironment.environment === "LIVE"} onClick={() => void prepareLive()}>Prepare LIVE</button><button disabled={busy || tradingEnvironment.environment === "PAPER"} onClick={() => void changeEnvironment("PAPER")}>Switch to PAPER</button><button disabled={busy || tradingEnvironment.environment === "LIVE" || tradingEnvironment.preparation_state !== "PREPARED"} onClick={() => void changeEnvironment("LIVE")}>Enable LIVE</button></div>
+          {tradingEnvironment.environment === "PAPER" ? <label>Type <code>{tradingEnvironment.live_confirmation_phrase}</code> to enable LIVE<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label> : null}
+          {tradingEnvironment.preparation_state === "PREPARED" ? <p className="form-message">Prepared account: <code>{tradingEnvironment.target_account_id}</code>. Preparation expires quickly and never enables execution by itself.</p> : null}
+        </section> : null}
         <h2 id="credential-settings-heading">Credential Settings</h2>
         <CredentialSettings />
       </section>

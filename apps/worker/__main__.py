@@ -8,9 +8,9 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import ReconciliationService
 from packages.configuration.settings import get_settings
@@ -28,6 +28,7 @@ from packages.database.models import (
     WorkspaceRecord,
 )
 from packages.database.session import Database
+from packages.domain.system import TradingEnvironment
 from packages.event_bus.client import JetStreamEventBus
 from packages.execution.conditional_exit_runner import process_workspace_exit_approvals
 from packages.execution.conditional_runner import process_workspace_approvals
@@ -111,11 +112,19 @@ async def _workspace_runtime(
     stop: asyncio.Event,
 ) -> None:
     credential_store = CredentialStore(database.sessions, cipher)
-    secret = await credential_store.reveal(workspace_id, "ALPACA")
+    async with database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await credential_store.reveal(workspace_id, provider)
     if secret is None:
         return
-    adapter = AlpacaPaperBrokerAdapter(str(secret["api_key_id"]), str(secret["secret_key"]))
-    projections = PostgresBrokerProjectionStore(database.sessions, workspace_id)
+    adapter = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
+    projections = PostgresBrokerProjectionStore(database.sessions, workspace_id, environment)
     reconciliation = ReconciliationService(adapter, projections)
     local_stop = asyncio.Event()
     tasks: list[asyncio.Task[None]] = []
@@ -168,7 +177,16 @@ async def _discover_credentials(database: Database) -> list[WorkspaceCredentialR
                 select(WorkspaceCredentialRecord)
                 .join(WorkspaceRecord)
                 .where(
-                    WorkspaceCredentialRecord.provider == "ALPACA",
+                    or_(
+                        and_(
+                            WorkspaceCredentialRecord.provider == "ALPACA_PAPER",
+                            WorkspaceRecord.trading_environment == TradingEnvironment.PAPER.value,
+                        ),
+                        and_(
+                            WorkspaceCredentialRecord.provider == "ALPACA_LIVE",
+                            WorkspaceRecord.trading_environment == TradingEnvironment.LIVE.value,
+                        ),
+                    ),
                     WorkspaceCredentialRecord.validation_status == "VERIFIED",
                     WorkspaceCredentialRecord.enabled.is_(True),
                     WorkspaceRecord.status != "SUSPENDED",
@@ -227,8 +245,13 @@ def _market_is_open(now: datetime) -> bool:
     return eastern.weekday() < 5 and 570 <= minutes < 960
 
 
-async def _alpaca_market_is_open(credential_store: CredentialStore, workspace_id: UUID) -> bool:
-    secret = await credential_store.reveal(workspace_id, "ALPACA")
+async def _alpaca_market_is_open(
+    credential_store: CredentialStore,
+    workspace_id: UUID,
+    environment: TradingEnvironment = TradingEnvironment.PAPER,
+) -> bool:
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await credential_store.reveal(workspace_id, provider)
     if secret is None:
         return False
     try:
@@ -271,7 +294,13 @@ async def _pre_session_supervisor(
             for workspace in workspaces:
                 if last_pre_scans.get(workspace.workspace_id) == local.date():
                     continue
-                secret = await credential_store.reveal(workspace.workspace_id, "ALPACA")
+                environment = TradingEnvironment(workspace.trading_environment)
+                provider = (
+                    "ALPACA_LIVE"
+                    if environment is TradingEnvironment.LIVE
+                    else "ALPACA_PAPER"
+                )
+                secret = await credential_store.reveal(workspace.workspace_id, provider)
                 if secret is None:
                     continue
                 async with database.sessions() as session:
@@ -368,7 +397,13 @@ async def _scanner_supervisor(
                 last = last_scans.get(workspace.workspace_id)
                 if last is not None and now - last < timedelta(minutes=5):
                     continue
-                secret = await credential_store.reveal(workspace.workspace_id, "ALPACA")
+                environment = TradingEnvironment(workspace.trading_environment)
+                provider = (
+                    "ALPACA_LIVE"
+                    if environment is TradingEnvironment.LIVE
+                    else "ALPACA_PAPER"
+                )
+                secret = await credential_store.reveal(workspace.workspace_id, provider)
                 if secret is None:
                     continue
                 async with database.sessions() as session:

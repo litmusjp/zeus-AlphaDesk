@@ -7,6 +7,7 @@ from typing import Protocol
 
 from packages.broker.adapter import BrokerAdapter, BrokerPreflightFailed
 from packages.domain.broker import BrokerOrder, OrderSubmission, SubmissionLeg
+from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import OrderIntent
 from packages.execution.order_state import BrokerFillState, broker_fill_state
 
@@ -81,10 +82,14 @@ class InMemoryIntentStore:
 
 
 def _broker_order_matches_intent(
-    order: BrokerOrder, intent: OrderIntent, expected_broker_account_id: str | None
+    order: BrokerOrder,
+    intent: OrderIntent,
+    expected_broker_account_id: str | None,
+    expected_environment: TradingEnvironment = TradingEnvironment.PAPER,
 ) -> bool:
     if expected_broker_account_id is not None and (
-        order.broker_account_id != expected_broker_account_id or order.environment != "PAPER"
+        order.broker_account_id != expected_broker_account_id
+        or order.environment != expected_environment.value
     ):
         return False
     if (
@@ -145,11 +150,13 @@ class ExecutionEngine:
         *,
         preflight: ExecutionPreflight | None = None,
         submission_fence: SubmissionFence | None = None,
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
     ) -> None:
         self._adapter = adapter
         self._store = store
         self._preflight = preflight
         self._submission_fence = submission_fence
+        self._environment = environment
 
     async def execute(
         self, intent: OrderIntent, *, expected_broker_account_id: str | None = None
@@ -196,7 +203,9 @@ class ExecutionEngine:
                     "submission uncertainty persistence failed"
                 ) from state_error
             raise SubmissionUncertain("broker submission uncertain") from error
-        if not _broker_order_matches_intent(order, intent, expected_broker_account_id):
+        if not _broker_order_matches_intent(
+            order, intent, expected_broker_account_id, self._environment
+        ):
             try:
                 await self._store.set_state(
                     intent.client_order_id, ExecutionState.SUBMISSION_UNCERTAIN
@@ -224,7 +233,10 @@ class ExecutionEngine:
         order = await self._adapter.get_order(client_order_id=intent.client_order_id)
         if order is not None:
             if not _broker_order_matches_intent(
-                order, intent, expected_broker_account_id=expected_broker_account_id
+                order,
+                intent,
+                expected_broker_account_id=expected_broker_account_id,
+                expected_environment=self._environment,
             ):
                 try:
                     await self._store.set_state(

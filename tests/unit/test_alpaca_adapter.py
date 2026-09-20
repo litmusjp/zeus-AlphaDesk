@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from alpaca.common.exceptions import APIError
 
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter, AlpacaPaperBrokerAdapter
 from packages.domain.broker import (
     BrokerAccount,
     BrokerOrder,
@@ -15,6 +15,7 @@ from packages.domain.broker import (
     OrderSubmission,
     SubmissionLeg,
 )
+from packages.domain.system import TradingEnvironment
 from packages.execution.conditional_approval import ExitOrderSide
 
 
@@ -140,6 +141,23 @@ async def test_alpaca_types_are_normalized_at_the_adapter_boundary() -> None:
     assert snapshot.account.equity.as_tuple().exponent == -2
     assert snapshot.positions[0].asset_class == "us_option"
     assert snapshot.open_orders[0].client_order_id == "ad-intent-1"
+
+
+@pytest.mark.asyncio
+async def test_adapter_carries_explicit_live_environment_without_fallback() -> None:
+    adapter = AlpacaBrokerAdapter(
+        "live-key",
+        "live-secret",
+        environment=TradingEnvironment.LIVE,
+        trading_client=FakeTradingClient(),
+        trading_stream=FakeTradingStream(),
+    )
+
+    snapshot = await adapter.reconcile()
+
+    assert snapshot.account.environment == "LIVE"
+    assert snapshot.positions[0].environment == "LIVE"
+    assert snapshot.open_orders[0].environment == "LIVE"
 
 
 @pytest.mark.asyncio

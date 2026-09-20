@@ -4,7 +4,7 @@ This branch makes the Connected Paper Workspace the sole supported application f
 
 ## Current milestone
 
-Authenticated, invitation-controlled Connected Paper development remains the product boundary. The application is paper-only, tenant-isolated, and guarded by deterministic risk controls, explicit human confirmation, and broker reconciliation.
+Authenticated, invitation-controlled workspaces remain tenant-isolated and guarded by deterministic risk controls, explicit human confirmation, broker reconciliation, and an immutable persisted trading-environment boundary. PAPER is the default; LIVE is fail-closed behind admin-only readiness gates.
 
 ## Delivered capabilities
 
@@ -15,8 +15,8 @@ Authenticated, invitation-controlled Connected Paper development remains the pro
 | Authentication | Hosted Supabase JWT login plus strict server-side invitation registration are implemented. Public Supabase signup is disabled. |
 | Administration | Protected Admin Console, invitation creation/disablement, and invitation-free provisioning for an existing administrator identity are implemented. |
 | Tenant isolation | Workspaces scope credentials, broker state, projections, intents, events, Guardian state, opportunities, scan runs, AI runs, audit state, and NATS subjects. Browser-supplied tenant IDs are not trusted. |
-| Credential vault | Alpaca paper and AI-provider secrets are write-only and encrypted with versioned tenant-bound AES-256-GCM. |
-| Alpaca state | The worker supervises each verified workspace independently, reconciles paper account state, and consumes trade updates. |
+| Credential vault | Separate `ALPACA_PAPER` and `ALPACA_LIVE` identities plus AI-provider secrets are write-only and encrypted with versioned tenant-bound AES-256-GCM. |
+| Alpaca state | The worker selects the persisted workspace environment, matching credentials, explicit `paper=True`/`paper=False` client, and environment-bound projections. LIVE has a separate admin-only PREPARED phase; preparation never changes PAPER or enables orders. |
 | Options and risk | Bounded-risk structures, payoff calculations, break-even, Greeks, liquidity filtering, deterministic risk policy, and undefined-risk rejection are implemented and tested. |
 | Market Scanner | 50-symbol watchlists, additive manual/AI discovery, checkbox removals, real Alpaca evidence, market countdown, closed-market guidance, no synthetic fallback, and tenant-scoped scan history are implemented. |
 | AI workflow | BYOK provider integration, arbitrary model IDs, capability probe, strict schema validation, citations, retries/timeouts, response healing, and safe AI-only degradation are implemented. AI has no execution tools. |

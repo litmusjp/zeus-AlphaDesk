@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
-from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
 from packages.broker.validation import validate_broker_order_leg_identity
 from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
@@ -17,6 +17,7 @@ from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import ConnectedOpportunityRecord, WorkspaceRecord
 from packages.database.session import Database
 from packages.domain.broker import BrokerOrder
+from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import OrderIntent, RankedCandidate
 from packages.execution.conditional_approval import (
     ApprovalState,
@@ -27,7 +28,7 @@ from packages.execution.conditional_approval import (
     revalidate_for_submission,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
-from packages.execution.connected_paper import execute_connected_paper_order
+from packages.execution.connected_paper import execute_connected_order
 from packages.execution.engine import ExecutionBlocked, SubmissionUncertain
 from packages.execution.order_state import BrokerFillState, broker_fill_state
 from packages.security.credentials import CredentialCipher
@@ -239,8 +240,8 @@ async def process_workspace_approvals(
                         ConnectedOpportunityRecord.opportunity_id == approval_record.opportunity_id,
                     )
                 )
-                workspace_policy = await session.scalar(
-                    select(WorkspaceRecord.assessment_policy).where(
+                workspace = await session.scalar(
+                    select(WorkspaceRecord).where(
                         WorkspaceRecord.workspace_id == workspace_id
                     )
                 )
@@ -265,7 +266,20 @@ async def process_workspace_approvals(
                 )
                 continue
             approved_intent = OrderIntent.model_validate(approval_record.approved_intent_payload)
-            secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")
+            if workspace is None:
+                await _finish(
+                    approval_record.approval_id,
+                    state=ApprovalState.CONDITION_FAILED,
+                    now=now,
+                    reason="workspace_missing",
+                )
+                continue
+            environment = TradingEnvironment(workspace.trading_environment)
+            provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+            workspace_policy = workspace.assessment_policy
+            secret = await CredentialStore(database.sessions, cipher).reveal(
+                workspace_id, provider
+            )
             if secret is None:
                 await _finish(
                     approval_record.approval_id,
@@ -408,7 +422,7 @@ async def process_workspace_approvals(
             if submission_token is None:
                 continue
             submission_started = True
-            broker_order = await execute_connected_paper_order(
+            broker_order = await execute_connected_order(
                 database=database,
                 cipher=cipher,
                 workspace_id=workspace_id,
@@ -419,6 +433,7 @@ async def process_workspace_approvals(
                 approval_id=approval_record.approval_id,
                 claim_token=claim_token,
                 submission_token=submission_token,
+                environment=environment,
             )
             if not _open_order_matches(
                 broker_order,
@@ -497,10 +512,18 @@ async def _recover_ready_to_submit(
     records += await store.list_dispatch_authorized(workspace_id=workspace_id, approval_kind="OPEN")
     if not records:
         return
-    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")
+    async with database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
     if secret is None:
         return
-    broker = AlpacaPaperBrokerAdapter(str(secret["api_key_id"]), str(secret["secret_key"]))
+    broker = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
     try:
         for record in records:
             now = datetime.now(UTC)

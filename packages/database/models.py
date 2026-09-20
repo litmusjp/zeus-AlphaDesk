@@ -48,6 +48,7 @@ class WorkspaceRecord(Base):
     )
     name: Mapped[str] = mapped_column(String(120))
     workspace_type: Mapped[str] = mapped_column(String(32), default="CONNECTED_PAPER")
+    trading_environment: Mapped[str] = mapped_column(String(16), default="PAPER", index=True)
     status: Mapped[str] = mapped_column(String(32), default="ONBOARDING", index=True)
     scanner_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     assessment_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
@@ -226,6 +227,7 @@ class ConditionalApprovalRecord(Base):
         PostgreSQLUUID(as_uuid=True), ForeignKey("app_users.user_id", ondelete="RESTRICT")
     )
     state: Mapped[str] = mapped_column(String(32), index=True)
+    execution_environment: Mapped[str] = mapped_column(String(16), default="PAPER", index=True)
     approval_kind: Mapped[str] = mapped_column(String(16), default="OPEN", index=True)
     session_date: Mapped[date] = mapped_column(Date, index=True)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -256,6 +258,7 @@ class ConditionalApprovalRecord(Base):
     )
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    live_order_confirmation: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
@@ -327,6 +330,33 @@ class BrokerSyncStateRecord(Base):
     stream_connected: Mapped[bool] = mapped_column(Boolean, default=False)
     generation: Mapped[int] = mapped_column(Integer, default=0)
     divergence_count: Mapped[int] = mapped_column(Integer, default=0)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class LivePreparationRecord(Base):
+    """Fresh, server-created evidence for a target LIVE account.
+
+    This is deliberately separate from the persisted workspace environment and
+    never claims that a long-running trade-updates stream is connected.
+    """
+
+    __tablename__ = "live_preparations"
+
+    workspace_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    target_environment: Mapped[str] = mapped_column(String(16))
+    target_account_id: Mapped[str] = mapped_column(String(64))
+    credential_fingerprint: Mapped[str] = mapped_column(String(16))
+    authenticated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reconciled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    account_active: Mapped[bool] = mapped_column(Boolean)
+    account_unblocked: Mapped[bool] = mapped_column(Boolean)
+    stream_connected: Mapped[bool] = mapped_column(Boolean, default=False)
     failure_reason: Mapped[str | None] = mapped_column(Text)
 
 

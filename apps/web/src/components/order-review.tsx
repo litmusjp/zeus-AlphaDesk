@@ -14,6 +14,7 @@ type OrderIntent = { client_order_id: string; quantity: number; limit_price: str
 type OptionDiagnostics = { total_contracts: number; requested_type_contracts: number; strict_eligible_contracts: number; selected_contracts: number; rejection_counts: Record<string, number> };
 type Analysis = { opportunity_id: string; symbol: string; disposition: string; source: string; observed_at: string; expires_at: string; signal: Record<string, unknown>; candidate: Candidate | null; risk_decision: RiskDecision | null; order_intent: OrderIntent | null; option_diagnostics: OptionDiagnostics | null; reason_codes: string[] };
 type ConditionalApproval = { approval_id: string; opportunity_id: string; state: string; session_date: string; approved_at: string; expires_at: string; max_limit_price: string; max_loss: string; max_quantity: number; max_quote_age_seconds: number; failure_reason: string | null };
+type Workspace = { trading_environment: "PAPER" | "LIVE" };
 
 export function OrderReview({ id }: { id: string }) {
   const [opportunity, setOpportunity] = useState<Analysis | null>(null);
@@ -21,14 +22,18 @@ export function OrderReview({ id }: { id: string }) {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState<Date | null>(null);
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [liveConfirmation, setLiveConfirmation] = useState("");
 
   const refresh = useCallback(async () => {
-    const [nextOpportunity, approvals] = await Promise.all([
+    const [nextOpportunity, approvals, nextWorkspace] = await Promise.all([
       deskFetch<Analysis>(`/desk/opportunities/${id}`),
       deskFetch<ConditionalApproval[]>("/desk/approvals"),
+      deskFetch<Workspace>("/desk/workspace"),
     ]);
     setOpportunity(nextOpportunity);
     setApproval(approvals.find((item) => item.opportunity_id === id) ?? null);
+    setWorkspace(nextWorkspace);
   }, [id]);
 
   useEffect(() => {
@@ -70,6 +75,7 @@ export function OrderReview({ id }: { id: string }) {
           max_loss: structure.max_loss,
           max_quantity: recommendedQuantity,
           max_quote_age_seconds: 30,
+          live_order_confirmation: workspace?.trading_environment === "LIVE" ? liveConfirmation : null,
         }),
       });
       setApproval(nextApproval);
@@ -113,7 +119,8 @@ export function OrderReview({ id }: { id: string }) {
       <aside className="control-panel confirmation-panel">
         <Clock3 /><small>CONDITIONAL NEXT-SESSION APPROVAL</small>
         {approval ? <><strong>{approval.state.replaceAll("_", " ")}</strong><p>Session: {approval.session_date}<br />Maximum price: ${approval.max_limit_price}<br />Maximum loss: ${approval.max_loss}<br />Quote age: {approval.max_quote_age_seconds}s</p>{approval.failure_reason ? <p className="form-message">Reason: {approval.failure_reason}</p> : null}</> : <p>Approve once before sleep. At the next U.S. session open, the worker checks the live structure, quote, risk, and broker state before submitting.</p>}
-        {approvalCanReject ? <button className="secondary-button" disabled={busy} onClick={() => void rejectApproval()}>Reject approval</button> : canRenewApproval ? <button disabled={!canApprove || busy} onClick={() => void approveForSession()}>Approve for next U.S. session</button> : null}
+        {workspace?.trading_environment === "LIVE" && canRenewApproval ? <label>Type ENABLE LIVE TRADING to confirm this exact first live order<input value={liveConfirmation} onChange={(event) => setLiveConfirmation(event.target.value)} /></label> : null}
+        {approvalCanReject ? <button className="secondary-button" disabled={busy} onClick={() => void rejectApproval()}>Reject approval</button> : canRenewApproval ? <button disabled={!canApprove || busy || (workspace?.trading_environment === "LIVE" && liveConfirmation !== "ENABLE LIVE TRADING")} onClick={() => void approveForSession()}>Approve for next U.S. session</button> : null}
       </aside>
     </div>
     {message ? <p className="form-message">{message}</p> : null}

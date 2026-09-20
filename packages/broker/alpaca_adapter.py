@@ -28,6 +28,7 @@ from packages.domain.broker import (
     OrderSubmission,
     ReconciliationSnapshot,
 )
+from packages.domain.system import TradingEnvironment
 from packages.execution.conditional_approval import ExitOrderSide
 
 
@@ -61,27 +62,30 @@ def _required_datetime(value: object | None) -> datetime:
     return mapped
 
 
-class AlpacaPaperBrokerAdapter:
-    """The sole Alpaca SDK boundary. It always constructs paper clients."""
+class AlpacaBrokerAdapter:
+    """The sole Alpaca SDK boundary; the environment is explicit and immutable."""
 
     def __init__(
         self,
         api_key: str,
         secret_key: str,
         *,
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
         trading_client: Any | None = None,
         trading_stream: Any | None = None,
     ) -> None:
         if not api_key or not secret_key:
-            raise ValueError("Paper Alpaca credentials are required for the broker adapter.")
-        self._client = trading_client or TradingClient(api_key, secret_key, paper=True)
-        self._stream = trading_stream or TradingStream(api_key, secret_key, paper=True)
+            raise ValueError("Alpaca credentials are required for the broker adapter.")
+        self._environment = environment
+        paper = environment is TradingEnvironment.PAPER
+        self._client = trading_client or TradingClient(api_key, secret_key, paper=paper)
+        self._stream = trading_stream or TradingStream(api_key, secret_key, paper=paper)
         self._stream_task: asyncio.Task[None] | None = None
 
-    @staticmethod
-    def _map_account(raw: Any) -> BrokerAccount:
+    def _map_account(self, raw: Any) -> BrokerAccount:
         return BrokerAccount(
             account_id=_text(raw.id),
+            environment=self._environment.value,
             account_number=_text(raw.account_number),
             status=_text(raw.status),
             currency=_text(raw.currency, "USD"),
@@ -95,10 +99,10 @@ class AlpacaPaperBrokerAdapter:
             trade_suspended_by_user=bool(raw.trade_suspended_by_user),
         )
 
-    @staticmethod
-    def _map_position(raw: Any) -> BrokerPosition:
+    def _map_position(self, raw: Any) -> BrokerPosition:
         return BrokerPosition(
             asset_id=_text(raw.asset_id),
+            environment=self._environment.value,
             symbol=_text(raw.symbol),
             asset_class=_text(raw.asset_class),
             side=_text(raw.side),
@@ -111,8 +115,7 @@ class AlpacaPaperBrokerAdapter:
             current_price=_optional_decimal(raw.current_price),
         )
 
-    @classmethod
-    def _map_order(cls, raw: Any) -> BrokerOrder:
+    def _map_order(self, raw: Any) -> BrokerOrder:
         legs = tuple(
             BrokerOrderLeg(
                 broker_order_id=_text(leg.id),
@@ -126,6 +129,7 @@ class AlpacaPaperBrokerAdapter:
         )
         return BrokerOrder(
             broker_order_id=_text(raw.id),
+            environment=self._environment.value,
             client_order_id=_text(raw.client_order_id),
             status=_text(raw.status, "unknown"),
             asset_class=_text(raw.asset_class),
@@ -144,11 +148,10 @@ class AlpacaPaperBrokerAdapter:
             legs=legs,
         )
 
-    @classmethod
-    def _map_trade_update(cls, raw: Any) -> BrokerTradeUpdate:
+    def _map_trade_update(self, raw: Any) -> BrokerTradeUpdate:
         return BrokerTradeUpdate(
             event=_text(raw.event),
-            order=cls._map_order(raw.order),
+            order=self._map_order(raw.order),
             execution_id=_text(raw.execution_id) or None,
             price=_optional_decimal(raw.price),
             quantity=_optional_decimal(raw.qty),
@@ -320,3 +323,15 @@ class AlpacaPaperBrokerAdapter:
         except TimeoutError:
             self._stream_task.cancel()
         self._stream_task = None
+
+
+class AlpacaPaperBrokerAdapter(AlpacaBrokerAdapter):
+    """Compatibility name that can only construct a paper adapter."""
+
+    def __init__(self, api_key: str, secret_key: str, **kwargs: Any) -> None:
+        super().__init__(
+            api_key,
+            secret_key,
+            environment=TradingEnvironment.PAPER,
+            **kwargs,
+        )

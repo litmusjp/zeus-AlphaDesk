@@ -2,7 +2,7 @@
 
 **Bounded-risk AI options research desk with fail-closed supervisory control**
 
-AlphaDesk is a paper-only options research and execution desk. Quantitative risk rules and options math govern decisions; AI is a read-only qualitative analyst with no broker or execution authority.
+AlphaDesk is an environment-bound options research and execution desk. It defaults to PAPER; an admin may first prepare a separately credentialed LIVE target while remaining PAPER, then Enable LIVE only after fresh readiness gates, explicit live confirmation, and a separate first-live-order confirmation pass. The persisted LIVE worker must independently establish its trade-updates stream and reconciliation before execution. Quantitative risk rules and options math govern decisions; AI is a read-only qualitative analyst with no broker or execution authority.
 
 ## Connected Paper Workspace
 
@@ -12,10 +12,10 @@ AlphaDesk is developed and evaluated through one authenticated, invite-controlle
 - server-derived, tenant-isolated workspace ownership;
 - encrypted operator-owned Alpaca Paper and AI-provider credentials;
 - real-source market and options evidence with no synthetic fallback;
-- explicit human confirmation for every paper order;
+- explicit human confirmation for every order, plus a separate exact-intent confirmation before the first live order;
 - deterministic risk, Guardian, freshness, idempotency, and broker-reconciliation gates.
 
-Live-money trading is not supported. Alpaca paper funds are simulated.
+Existing workspaces, approvals, and orders remain PAPER-bound. No paper approval is reinterpreted as LIVE, and legacy `ALPACA` credential records are not valid for execution.
 
 ## Core controls
 
@@ -60,7 +60,8 @@ Changing `NEXT_PUBLIC_*` values requires rebuilding `web`. Changing API or worke
 
 ## Security boundaries
 
-- Every runtime is hard-locked to `PAPER_ONLY`; live endpoints and mode switches are absent.
+- Every new workspace starts in persisted `PAPER`. Runtime selection uses the persisted environment and its matching `ALPACA_PAPER` or `ALPACA_LIVE` credential identity; missing or mismatched readiness fails closed.
+- The Admin Console is the only mode-control surface. Mode changes are audited (including rejected attempts), blocked while orders, approvals, leases, ambiguous submissions, or positions exist, and require healthy Guardian, fresh reconciliation, a connected trade-update stream, and a healthy target account.
 - All operator routes require a verified Supabase JWT and derive workspace ownership server-side.
 - Supabase public signup is disabled; AlphaDesk validates invitations before creating identities through server-only Admin Auth.
 - Alpaca and AI-provider secrets are write-only, encrypted with tenant-bound AES-256-GCM, and never returned to the browser.

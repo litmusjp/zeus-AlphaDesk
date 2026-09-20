@@ -26,7 +26,7 @@ from packages.domain.broker import (
     BrokerTradeUpdate,
     ReconciliationSnapshot,
 )
-from packages.domain.system import BrokerState
+from packages.domain.system import BrokerState, TradingEnvironment
 
 
 class BrokerProjectionStore(Protocol):
@@ -72,25 +72,34 @@ def _order_values(order: BrokerOrder) -> dict[str, object]:
     }
 
 
-def _snapshot_validation_error(snapshot: ReconciliationSnapshot) -> str | None:
-    reason = validate_broker_account(snapshot.account)
+def _snapshot_validation_error(
+    snapshot: ReconciliationSnapshot,
+    expected_environment: TradingEnvironment = TradingEnvironment.PAPER,
+) -> str | None:
+    reason = validate_broker_account(snapshot.account, expected_environment)
     if reason is not None:
         return reason
     for position in snapshot.positions:
-        reason = validate_broker_position(position, snapshot.account)
+        reason = validate_broker_position(position, snapshot.account, expected_environment)
         if reason is not None:
             return reason
     for order in snapshot.open_orders:
-        reason = validate_broker_order(order, snapshot.account)
+        reason = validate_broker_order(order, snapshot.account, expected_environment)
         if reason is not None:
             return reason
     return None
 
 
 class PostgresBrokerProjectionStore:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], workspace_id: UUID) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        workspace_id: UUID,
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
+    ) -> None:
         self._sessions = sessions
         self._workspace_id = workspace_id
+        self._environment = environment
 
     async def _state_for_update(self, session: AsyncSession) -> BrokerSyncStateRecord:
         record = await session.get(BrokerSyncStateRecord, self._workspace_id, with_for_update=True)
@@ -123,7 +132,7 @@ class PostgresBrokerProjectionStore:
     async def apply_reconciliation(self, snapshot: ReconciliationSnapshot) -> int:
         async with self._sessions.begin() as session:
             state = await self._state_for_update(session)
-            validation_error = _snapshot_validation_error(snapshot)
+            validation_error = _snapshot_validation_error(snapshot, self._environment)
             if validation_error is not None:
                 state.state = BrokerState.UNKNOWN.value
                 state.failure_reason = "broker_evidence_invalid"
@@ -252,7 +261,7 @@ class PostgresBrokerProjectionStore:
                 trade_suspended_by_user=account.trade_suspended_by_user,
                 as_of=account.as_of,
             )
-            if validate_broker_order(update.order, account_model) is not None:
+            if validate_broker_order(update.order, account_model, self._environment) is not None:
                 state = await self._state_for_update(session)
                 state.state = BrokerState.UNKNOWN.value
                 state.failure_reason = "broker_evidence_invalid"
@@ -386,8 +395,9 @@ class PostgresBrokerProjectionStore:
 class MemoryBrokerProjectionStore:
     """Deterministic test double with broker-wins replacement semantics."""
 
-    def __init__(self) -> None:
+    def __init__(self, environment: TradingEnvironment = TradingEnvironment.PAPER) -> None:
         self.status = BrokerSyncStatus(state=BrokerState.NOT_CONFIGURED)
+        self.environment = environment
         self.account: BrokerAccount | None = None
         self.positions: dict[str, BrokerPosition] = {}
         self.orders: dict[str, BrokerOrder] = {}
@@ -404,7 +414,7 @@ class MemoryBrokerProjectionStore:
         )
 
     async def apply_reconciliation(self, snapshot: ReconciliationSnapshot) -> int:
-        validation_error = _snapshot_validation_error(snapshot)
+        validation_error = _snapshot_validation_error(snapshot, self.environment)
         if validation_error is not None:
             self.status = self.status.model_copy(
                 update={"state": BrokerState.UNKNOWN, "failure_reason": "broker_evidence_invalid"}
@@ -435,7 +445,10 @@ class MemoryBrokerProjectionStore:
         return divergence
 
     async def apply_trade_update(self, update: BrokerTradeUpdate) -> None:
-        if self.account is None or validate_broker_order(update.order, self.account) is not None:
+        if (
+            self.account is None
+            or validate_broker_order(update.order, self.account, self.environment) is not None
+        ):
             self.status = self.status.model_copy(
                 update={"state": BrokerState.UNKNOWN, "failure_reason": "broker_evidence_invalid"}
             )

@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from packages.broker.adapter import BrokerAdapter
 from packages.broker.projections import BrokerProjectionStore
-from packages.domain.system import BrokerState
+from packages.domain.system import BrokerState, TradingEnvironment
 from packages.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,9 +25,11 @@ class BrokerExecutionGate:
         projections: BrokerProjectionStore,
         *,
         maximum_reconciliation_age: timedelta = timedelta(seconds=90),
+        environment: TradingEnvironment = TradingEnvironment.PAPER,
     ) -> None:
         self._projections = projections
         self._maximum_age = maximum_reconciliation_age
+        self._environment = environment
 
     async def evaluate(self, now: datetime | None = None) -> ExecutionGateDecision:
         evaluated_at = now or datetime.now(UTC)
@@ -62,12 +64,12 @@ class BrokerExecutionGate:
         if any(
             position.identity_validated_at is None
             or position.broker_account_id != account.account_id
-            or position.environment != "PAPER"
+            or position.environment != self._environment.value
             for position in positions
         ) or any(
             order.identity_validated_at is None
             or order.broker_account_id != account.account_id
-            or order.environment != "PAPER"
+            or order.environment != self._environment.value
             for order in orders
         ):
             return ExecutionGateDecision(

@@ -15,6 +15,13 @@ class BrokerState(StrEnum):
     DIVERGENT = "DIVERGENT"
 
 
+class TradingEnvironment(StrEnum):
+    """The persisted broker boundary for a workspace."""
+
+    PAPER = "PAPER"
+    LIVE = "LIVE"
+
+
 class SystemStatus(BaseModel):
     mode: SystemMode
     environment: str

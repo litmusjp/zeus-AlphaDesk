@@ -5,7 +5,7 @@ import { Bot, CheckCircle2, KeyRound, LockKeyhole, Trash2 } from "lucide-react";
 
 import { deskFetch } from "@/lib/api";
 
-type Provider = "alpaca" | "openrouter" | "anthropic";
+type Provider = "alpaca-paper" | "alpaca-live" | "openrouter" | "anthropic";
 type Status = {
   provider: string;
   configured: boolean;
@@ -18,8 +18,10 @@ type Status = {
 
 export function CredentialSettings() {
   const [statuses, setStatuses] = useState<Status[]>([]);
-  const [alpacaKey, setAlpacaKey] = useState("");
-  const [alpacaSecret, setAlpacaSecret] = useState("");
+  const [alpacaPaperKey, setAlpacaPaperKey] = useState("");
+  const [alpacaPaperSecret, setAlpacaPaperSecret] = useState("");
+  const [alpacaLiveKey, setAlpacaLiveKey] = useState("");
+  const [alpacaLiveSecret, setAlpacaLiveSecret] = useState("");
   const [openRouterKey, setOpenRouterKey] = useState("");
   const [openRouterModel, setOpenRouterModel] = useState("openai/gpt-4.1-mini");
   const [anthropicKey, setAnthropicKey] = useState("");
@@ -42,17 +44,23 @@ export function CredentialSettings() {
     setBusy(true);
     setMessage("");
     try {
-      const payload = provider === "alpaca"
-        ? { api_key_id: alpacaKey, secret_key: alpacaSecret }
+      const payload = provider === "alpaca-paper"
+        ? { api_key_id: alpacaPaperKey, secret_key: alpacaPaperSecret }
+        : provider === "alpaca-live"
+          ? { api_key_id: alpacaLiveKey, secret_key: alpacaLiveSecret }
         : provider === "openrouter"
           ? { api_key: openRouterKey, model: openRouterModel }
           : { api_key: anthropicKey, model: anthropicModel };
-      const endpoint = `/desk/credentials/${provider}${save ? "" : "/test"}`;
+      const credentialEndpoint = provider === "alpaca-paper" ? "alpaca" : provider;
+      const endpoint = `/desk/credentials/${credentialEndpoint}${save ? "" : "/test"}`;
       await deskFetch(endpoint, { method: save ? "PUT" : "POST", body: JSON.stringify(payload) });
       if (save) {
-        if (provider === "alpaca") {
-          setAlpacaKey("");
-          setAlpacaSecret("");
+        if (provider === "alpaca-paper") {
+          setAlpacaPaperKey("");
+          setAlpacaPaperSecret("");
+        } else if (provider === "alpaca-live") {
+          setAlpacaLiveKey("");
+          setAlpacaLiveSecret("");
         } else if (provider === "openrouter") {
           setOpenRouterKey("");
         } else {
@@ -60,7 +68,7 @@ export function CredentialSettings() {
         }
         await refresh();
       }
-      const label = provider === "alpaca" ? "Alpaca paper" : provider === "openrouter" ? "OpenRouter" : "Anthropic";
+      const label = provider === "alpaca-paper" ? "Alpaca paper" : provider === "alpaca-live" ? "Alpaca live" : provider === "openrouter" ? "OpenRouter" : "Anthropic";
       setMessage(`${label} ${save ? "verified and encrypted" : "validation passed"}.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Validation failed");
@@ -73,7 +81,8 @@ export function CredentialSettings() {
     setBusy(true);
     setMessage("");
     try {
-      await deskFetch(`/desk/credentials/${provider}`, { method: "DELETE" });
+      const credentialEndpoint = provider === "alpaca-paper" ? "alpaca" : provider;
+      await deskFetch(`/desk/credentials/${credentialEndpoint}`, { method: "DELETE" });
       await refresh();
       setMessage("Credential removed and dependent access disabled.");
     } catch (error) {
@@ -83,7 +92,8 @@ export function CredentialSettings() {
     }
   }
 
-  const alpaca = statuses.find((status) => status.provider === "ALPACA");
+  const alpacaPaper = statuses.find((status) => status.provider === "ALPACA_PAPER");
+  const alpacaLive = statuses.find((status) => status.provider === "ALPACA_LIVE");
   const openRouter = statuses.find((status) => status.provider === "OPENROUTER");
   const anthropic = statuses.find((status) => status.provider === "ANTHROPIC");
 
@@ -98,17 +108,8 @@ export function CredentialSettings() {
       </div>
       <p className="form-message">{message}</p>
       <div className="settings-grid">
-        <form className="credential-card" onSubmit={(event) => void submit(event, "alpaca", true)}>
-          <div className="provider-title"><KeyRound /><div><h2>Alpaca Markets</h2><p>Paper endpoint only</p></div><StatusPill status={alpaca} /></div>
-          <StoredStatus status={alpaca} />
-          <label>Paper API key ID<input required minLength={8} autoComplete="off" value={alpacaKey} onChange={(event) => setAlpacaKey(event.target.value)} /></label>
-          <label>Paper API secret<input required minLength={8} type="password" autoComplete="new-password" value={alpacaSecret} onChange={(event) => setAlpacaSecret(event.target.value)} /></label>
-          <div className="button-row">
-            <button type="button" className="secondary-button" disabled={busy || !alpacaKey || !alpacaSecret} onClick={(event) => void submit(event as unknown as FormEvent, "alpaca", false)}>Test paper connection</button>
-            <button disabled={busy}>Test &amp; save encrypted</button>
-            {alpaca?.configured ? <button type="button" className="icon-button" aria-label="Delete Alpaca credentials" onClick={() => void remove("alpaca")}><Trash2 /></button> : null}
-          </div>
-        </form>
+        <AlpacaCredentialCard environment="paper" status={alpacaPaper} apiKey={alpacaPaperKey} secret={alpacaPaperSecret} busy={busy} onKeyChange={setAlpacaPaperKey} onSecretChange={setAlpacaPaperSecret} onSubmit={(event, save) => void submit(event, "alpaca-paper", save)} onRemove={() => void remove("alpaca-paper")} />
+        <AlpacaCredentialCard environment="live" status={alpacaLive} apiKey={alpacaLiveKey} secret={alpacaLiveSecret} busy={busy} onKeyChange={setAlpacaLiveKey} onSecretChange={setAlpacaLiveSecret} onSubmit={(event, save) => void submit(event, "alpaca-live", save)} onRemove={() => void remove("alpaca-live")} />
 
         <AICredentialCard
           provider="openrouter"
@@ -144,6 +145,18 @@ export function CredentialSettings() {
       </div>
     </>
   );
+}
+
+function AlpacaCredentialCard({ environment, status, apiKey, secret, busy, onKeyChange, onSecretChange, onSubmit, onRemove }: { environment: "paper" | "live"; status: Status | undefined; apiKey: string; secret: string; busy: boolean; onKeyChange: (value: string) => void; onSecretChange: (value: string) => void; onSubmit: (event: FormEvent, save: boolean) => void; onRemove: () => void }) {
+  const live = environment === "live";
+  return <form className="credential-card" onSubmit={(event) => onSubmit(event, true)}>
+    <div className="provider-title"><KeyRound /><div><h2>Alpaca {live ? "Live" : "Paper"}</h2><p>{live ? "Live endpoint — dangerous mode" : "Paper endpoint"}</p></div><StatusPill status={status} /></div>
+    {live ? <div className="mode-banner danger"><LockKeyhole /><div><strong>LIVE can send real orders.</strong><span>This credential is separate from paper and never selected implicitly.</span></div></div> : null}
+    <StoredStatus status={status} />
+    <label>{live ? "Live" : "Paper"} API key ID<input required minLength={8} autoComplete="off" value={apiKey} onChange={(event) => onKeyChange(event.target.value)} /></label>
+    <label>{live ? "Live" : "Paper"} API secret<input required minLength={8} type="password" autoComplete="new-password" value={secret} onChange={(event) => onSecretChange(event.target.value)} /></label>
+    <div className="button-row"><button type="button" className="secondary-button" disabled={busy || !apiKey || !secret} onClick={(event) => onSubmit(event as unknown as FormEvent, false)}>Test {live ? "live" : "paper"} connection</button><button disabled={busy}>Test &amp; save encrypted</button>{status?.configured ? <button type="button" className="icon-button" aria-label={`Delete Alpaca ${environment} credentials`} onClick={onRemove}><Trash2 /></button> : null}</div>
+  </form>;
 }
 
 function AICredentialCard({

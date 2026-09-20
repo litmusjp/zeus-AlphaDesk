@@ -3,22 +3,31 @@ from __future__ import annotations
 from decimal import Decimal
 
 from packages.domain.broker import BrokerAccount, BrokerOrder, BrokerPosition
+from packages.domain.system import TradingEnvironment
 from packages.execution.order_state import broker_fill_state
 
 
-def validate_broker_account(account: BrokerAccount) -> str | None:
-    if account.environment.upper() != "PAPER":
-        return "paper_environment_required"
+def validate_broker_account(
+    account: BrokerAccount,
+    expected_environment: TradingEnvironment | str = TradingEnvironment.PAPER,
+) -> str | None:
+    expected = str(expected_environment).upper()
+    if account.environment.upper() != expected:
+        return "broker_environment_mismatch"
     if not account.account_id:
         return "broker_account_identity_missing"
     return None
 
 
-def validate_broker_position(position: BrokerPosition, account: BrokerAccount) -> str | None:
+def validate_broker_position(
+    position: BrokerPosition,
+    account: BrokerAccount,
+    expected_environment: TradingEnvironment | str = TradingEnvironment.PAPER,
+) -> str | None:
     if position.broker_account_id != account.account_id:
         return "broker_account_identity_mismatch"
-    if (position.environment or "").upper() != "PAPER":
-        return "paper_environment_required"
+    if (position.environment or "").upper() != str(expected_environment).upper():
+        return "broker_environment_mismatch"
     if position.asset_class.lower() not in {"us_option", "us_equity"}:
         return "unknown_asset_class"
     if not position.quantity.is_finite() or position.quantity <= 0:
@@ -41,11 +50,15 @@ def validate_broker_order_leg_identity(order: BrokerOrder) -> str | None:
     return None
 
 
-def validate_broker_order(order: BrokerOrder, account: BrokerAccount) -> str | None:
+def validate_broker_order(
+    order: BrokerOrder,
+    account: BrokerAccount,
+    expected_environment: TradingEnvironment | str = TradingEnvironment.PAPER,
+) -> str | None:
     if order.broker_account_id != account.account_id:
         return "broker_account_identity_mismatch"
-    if (order.environment or "").upper() != "PAPER":
-        return "paper_environment_required"
+    if (order.environment or "").upper() != str(expected_environment).upper():
+        return "broker_environment_mismatch"
     if not order.broker_order_id or not order.client_order_id:
         return "broker_order_identity_missing"
     if order.asset_class.lower() not in {"us_option", "us_equity"}:
