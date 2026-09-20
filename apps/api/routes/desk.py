@@ -1360,7 +1360,7 @@ async def research_watchlist(
                                 symbol,
                                 scan_run_id=research_run.scan_run_id,
                                 mode=ScanMode.PRE_SCAN,
-                                create_intent=False,
+                                create_intent=True,
                             ),
                             timeout=30,
                         )

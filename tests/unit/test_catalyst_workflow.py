@@ -157,6 +157,47 @@ def test_risk_veto_cannot_create_order_intent() -> None:
         create_order_intent(rejected, candidate)
 
 
+def test_pre_scan_defers_broker_state_but_approves_deterministic_risk() -> None:
+    candidate, _, _ = approved_workflow()
+    decision = RiskEngine(RiskPolicy()).evaluate(
+        candidate,
+        RiskContext(
+            paper_equity="100000",
+            open_planned_loss=0,
+            underlying_open_risk=0,
+            daily_loss=0,
+            drawdown_percent=0,
+            concurrent_option_structures=0,
+            broker_execution_allowed=False,
+            broker_state_required=False,
+        ),
+    )
+
+    assert decision.decision == "APPROVE"
+    broker_check = next(check for check in decision.checks if check.name == "broker_state")
+    assert broker_check.passed is True
+    assert "deferred" in broker_check.detail.lower()
+
+
+def test_execution_still_rejects_when_broker_state_is_unavailable() -> None:
+    candidate, _, _ = approved_workflow()
+    decision = RiskEngine(RiskPolicy()).evaluate(
+        candidate,
+        RiskContext(
+            paper_equity="100000",
+            open_planned_loss=0,
+            underlying_open_risk=0,
+            daily_loss=0,
+            drawdown_percent=0,
+            concurrent_option_structures=0,
+            broker_execution_allowed=False,
+        ),
+    )
+
+    assert decision.decision == "REJECT"
+    assert next(check for check in decision.checks if check.name == "broker_state").passed is False
+
+
 def test_done_for_day_partial_fill_preserves_open_exposure() -> None:
     assert (
         _broker_order_state("done_for_day", Decimal("1"), Decimal("2"))

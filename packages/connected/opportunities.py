@@ -117,6 +117,18 @@ def _scan_disposition(
     return "RISK_REJECTED"
 
 
+def _pre_scan_reason_codes(
+    *, mode: ScanMode, create_intent: bool, risk_decision: str, broker_execution_allowed: bool
+) -> tuple[str, ...]:
+    if mode is not ScanMode.PRE_SCAN or not create_intent or risk_decision != "APPROVE":
+        return ()
+    return (
+        ("execution_validation_pending",)
+        if broker_execution_allowed
+        else ("execution_validation_pending", "broker_readiness_deferred")
+    )
+
+
 def _strategy_for_mode(mode: ScanMode, policy: AssessmentPolicy) -> CatalystMomentumStrategy:
     return CatalystMomentumStrategy(
         minimum_score=(
@@ -438,6 +450,8 @@ class ConnectedOpportunityService:
                     1 for position in positions if position.asset_class.lower() == "us_option"
                 ),
                 broker_execution_allowed=gate.allowed,
+                broker_state_required=mode is ScanMode.EXECUTION,
+                broker_execution_reason=gate.reason,
                 portfolio_greeks_available=portfolio_greeks_available,
             ),
         )
@@ -466,10 +480,11 @@ class ConnectedOpportunityService:
             risk_decision=risk.model_dump(mode="json"),
             order_intent=None if intent is None else intent.model_dump(mode="json"),
             option_diagnostics=option_diagnostics,
-            reason_codes=(
-                ("execution_validation_pending",)
-                if mode is ScanMode.PRE_SCAN and create_intent and risk.decision == "APPROVE"
-                else ()
+            reason_codes=_pre_scan_reason_codes(
+                mode=mode,
+                create_intent=create_intent,
+                risk_decision=risk.decision,
+                broker_execution_allowed=gate.allowed,
             ),
         )
         await self._persist(result)

@@ -11,12 +11,15 @@ from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.opportunities import (
     ConnectedOpportunityService,
     _maybe_create_order_intent,
+    _pre_scan_reason_codes,
     _scan_disposition,
     _strategy_for_mode,
 )
-from packages.connected.option_scan_policy import ScanMode
+from packages.connected.option_scan_policy import OptionScanDiagnostics, ScanMode
 from packages.domain.workflow import CatalystFeatures, Signal
+from packages.options.alpaca_adapter import OptionChainFetchDiagnostics
 from packages.strategy.catalyst import score_signal
+from tests.unit.test_catalyst_workflow import approved_workflow, features
 
 
 class StockClientStub:
@@ -87,6 +90,22 @@ def test_pre_scan_approved_candidate_is_reviewable_without_intent() -> None:
     )
 
 
+def test_pre_scan_reason_codes_reflect_broker_gate() -> None:
+    common = {
+        "mode": ScanMode.PRE_SCAN,
+        "create_intent": True,
+        "risk_decision": "APPROVE",
+    }
+
+    assert _pre_scan_reason_codes(**common, broker_execution_allowed=True) == (
+        "execution_validation_pending",
+    )
+    assert _pre_scan_reason_codes(**common, broker_execution_allowed=False) == (
+        "execution_validation_pending",
+        "broker_readiness_deferred",
+    )
+
+
 def test_pre_scan_without_intent_remains_research_only() -> None:
     assert (
         _scan_disposition(
@@ -121,6 +140,120 @@ def test_rejected_risk_with_intent_remains_rejected() -> None:
         )
         == "RISK_REJECTED"
     )
+
+
+@pytest.mark.asyncio
+async def test_pre_scan_gate_unavailable_is_candidate_without_order_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, _, _ = approved_workflow()
+    service = ConnectedOpportunityService.__new__(ConnectedOpportunityService)
+    service._sessions = SimpleNamespace()
+    service._workspace_id = uuid4()
+    service._policy = AssessmentPolicy()
+    service._options = SimpleNamespace(
+        get_chain_with_diagnostics=lambda _query: None,
+    )
+    persisted: list[Any] = []
+
+    async def get_chain(_query: Any) -> tuple[list[Any], Any]:
+        item = SimpleNamespace(
+            expiration=datetime(2026, 9, 25, tzinfo=UTC).date(),
+            strike=Decimal("100"),
+            contract_id="id-100",
+            quote=SimpleNamespace(ask=Decimal("2"), bid=Decimal("1")),
+            multiplier=100,
+        )
+        return [item, item], OptionChainFetchDiagnostics(2, 2, 2, 0, 0)
+
+    async def persist(result: Any) -> None:
+        persisted.append(result)
+
+    class ProjectionStore:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        async def get_account(self) -> Any:
+            return SimpleNamespace(equity=Decimal("100000"), last_equity=Decimal("100000"))
+
+        async def list_positions(self) -> list[Any]:
+            return []
+
+    class Gate:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        async def evaluate(self, _now: Any) -> Any:
+            return SimpleNamespace(allowed=False, reason="Broker reconciliation is stale.")
+
+    class Strategy:
+        def evaluate_signal(self, _signal: Any) -> Any:
+            return SimpleNamespace(
+                direction="BULLISH",
+                model_dump=lambda **_: {"direction": "BULLISH"},
+            )
+
+        def rank_candidates(self, _idea: Any, _structures: Any) -> list[Any]:
+            return [candidate]
+
+    service._options.get_chain_with_diagnostics = get_chain
+    service._persist = persist
+    monkeypatch.setattr(
+        "packages.connected.opportunities.PostgresBrokerProjectionStore", ProjectionStore
+    )
+    monkeypatch.setattr("packages.connected.opportunities.BrokerExecutionGate", Gate)
+    monkeypatch.setattr(
+        "packages.connected.opportunities._strategy_for_mode", lambda *_args: Strategy()
+    )
+    monkeypatch.setattr(
+        service,
+        "_features",
+        lambda _symbol: (features(), Decimal("100"), datetime(2026, 9, 20, 12, tzinfo=UTC)),
+    )
+    monkeypatch.setattr(
+        "packages.connected.opportunities.select_contracts",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected=[
+                SimpleNamespace(
+                    expiration=datetime(2026, 9, 25, tzinfo=UTC).date(),
+                    strike=Decimal("100"),
+                    contract_id="id-100",
+                    quote=SimpleNamespace(ask=Decimal("2"), bid=Decimal("1")),
+                    multiplier=100,
+                ),
+                SimpleNamespace(
+                    expiration=datetime(2026, 9, 25, tzinfo=UTC).date(),
+                    strike=Decimal("105"),
+                    contract_id="id-105",
+                    quote=SimpleNamespace(ask=Decimal("2"), bid=Decimal("1")),
+                    multiplier=100,
+                ),
+            ],
+            diagnostics=OptionScanDiagnostics(2, 2, 0, 2, {}),
+        ),
+    )
+    monkeypatch.setattr(
+        "packages.connected.opportunities.build_structure",
+        lambda *_args, **_kwargs: candidate.structure,
+    )
+    monkeypatch.setattr(
+        "packages.connected.opportunities.OptionLeg", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    result = await service.analyze("XYZ", mode=ScanMode.PRE_SCAN, create_intent=True)
+
+    assert result.disposition == "PRE_SCAN_CANDIDATE", result.reason_codes
+    assert result.reason_codes == (
+        "execution_validation_pending",
+        "broker_readiness_deferred",
+    )
+    assert result.order_intent is None
+    assert result.risk_decision["decision"] == "APPROVE"
+    assert result.risk_decision["checks"][0]["detail"].startswith(
+        "Broker execution readiness deferred"
+    )
+    assert result.option_diagnostics["strict_eligible_contracts"] == 0
+    assert persisted == [result]
 
 
 @pytest.mark.asyncio

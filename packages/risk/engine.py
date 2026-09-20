@@ -43,6 +43,8 @@ class RiskContext(BaseModel):
     portfolio_vega: Decimal = Decimal("0")
     portfolio_greeks_available: bool = True
     broker_execution_allowed: bool
+    broker_state_required: bool = True
+    broker_execution_reason: str | None = None
     duplicate_logical_order: bool = False
 
 
@@ -57,8 +59,14 @@ class RiskEngine:
         checks = (
             RiskCheck(
                 name="broker_state",
-                passed=context.broker_execution_allowed,
-                detail="Broker state must be fresh, reconciled, connected, and unblocked.",
+                passed=(not context.broker_state_required or context.broker_execution_allowed),
+                detail=(
+                    "Broker execution readiness deferred for pre-scan; fresh reconciliation is "
+                    "required before execution."
+                    if not context.broker_state_required
+                    else context.broker_execution_reason
+                    or "Broker state must be fresh, reconciled, connected, and unblocked."
+                ),
             ),
             RiskCheck(
                 name="duplicate_logical_order",

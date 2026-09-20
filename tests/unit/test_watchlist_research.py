@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +14,11 @@ from packages.ai.watchlist import (
     _compact_evidence,
     run_watchlist_research,
 )
+
+
+def test_watchlist_research_requests_pre_scan_candidate_evidence() -> None:
+    source = Path("apps/api/routes/desk.py").read_text()
+    assert re.search(r"mode=ScanMode\.PRE_SCAN,\s+create_intent=True", source) is not None
 
 
 def test_discovery_universe_includes_existing_symbols_and_additional_candidates() -> None:
