@@ -18,6 +18,7 @@ from alpaca.trading.enums import (
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, OptionLegRequest
 from alpaca.trading.stream import TradingStream
 
+from packages.broker.adapter import BrokerPreflightFailed
 from packages.domain.broker import (
     BrokerAccount,
     BrokerOrder,
@@ -158,7 +159,7 @@ class AlpacaPaperBrokerAdapter:
     async def _attach_execution_identity(self, order: BrokerOrder) -> BrokerOrder:
         account = await self.get_account()
         return order.model_copy(
-            update={"broker_account_id": account.account_id, "environment": "PAPER"}
+            update={"broker_account_id": account.account_id, "environment": account.environment}
         )
 
     async def get_account(self) -> BrokerAccount:
@@ -167,14 +168,32 @@ class AlpacaPaperBrokerAdapter:
 
     async def list_positions(self) -> tuple[BrokerPosition, ...]:
         raw = await asyncio.to_thread(self._client.get_all_positions)
-        return tuple(self._map_position(position) for position in raw)
+        account = await self.get_account()
+        return tuple(
+            self._map_position(position).model_copy(
+                update={"broker_account_id": account.account_id, "environment": account.environment}
+            )
+            for position in raw
+        )
 
     async def list_open_orders(self) -> tuple[BrokerOrder, ...]:
         request = GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True)
         raw = await asyncio.to_thread(self._client.get_orders, request)
-        return tuple(self._map_order(order) for order in raw)
+        account = await self.get_account()
+        return tuple(
+            self._map_order(order).model_copy(
+                update={"broker_account_id": account.account_id, "environment": account.environment}
+            )
+            for order in raw
+        )
+
+    async def _require_open_market(self) -> None:
+        clock = await asyncio.to_thread(self._client.get_clock)
+        if not bool(clock.is_open):
+            raise BrokerPreflightFailed("Alpaca market session is closed")
 
     async def submit_order(self, order: OrderSubmission) -> BrokerOrder:
+        await self._require_open_market()
         request = LimitOrderRequest(
             qty=order.quantity,
             limit_price=float(order.limit_price),
@@ -190,13 +209,20 @@ class AlpacaPaperBrokerAdapter:
                 for leg in order.legs
             ],
         )
-        raw = await asyncio.to_thread(self._client.submit_order, request)
+        try:
+            raw = await asyncio.to_thread(self._client.submit_order, request)
+        except APIError:
+            existing = await self.get_order(client_order_id=order.client_order_id)
+            if existing is None:
+                raise
+            return existing
         return await self._attach_execution_identity(self._map_order(raw))
 
     async def cancel_order(self, broker_order_id: str) -> None:
         await asyncio.to_thread(self._client.cancel_order_by_id, broker_order_id)
 
     async def close_position(self, symbol_or_asset_id: str) -> BrokerOrder:
+        await self._require_open_market()
         raw = await asyncio.to_thread(self._client.close_position, symbol_or_asset_id)
         return await self._attach_execution_identity(self._map_order(raw))
 
@@ -211,6 +237,7 @@ class AlpacaPaperBrokerAdapter:
     ) -> BrokerOrder:
         if quantity <= 0:
             raise ValueError("Close quantity must be positive.")
+        await self._require_open_market()
         side = OrderSide.SELL if order_side is ExitOrderSide.SELL else OrderSide.BUY
         position_intent = (
             PositionIntent.SELL_TO_CLOSE
@@ -227,7 +254,13 @@ class AlpacaPaperBrokerAdapter:
             position_intent=position_intent,
             client_order_id=client_order_id,
         )
-        raw = await asyncio.to_thread(self._client.submit_order, request)
+        try:
+            raw = await asyncio.to_thread(self._client.submit_order, request)
+        except APIError:
+            existing = await self.get_order(client_order_id=client_order_id)
+            if existing is None:
+                raise
+            return existing
         return await self._attach_execution_identity(self._map_order(raw))
 
     async def get_order(
@@ -264,7 +297,11 @@ class AlpacaPaperBrokerAdapter:
         loop = asyncio.get_running_loop()
 
         async def handler(raw: Any) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, self._map_trade_update(raw))
+            update = self._map_trade_update(raw)
+            update = update.model_copy(
+                update={"order": await self._attach_execution_identity(update.order)}
+            )
+            loop.call_soon_threadsafe(queue.put_nowait, update)
 
         self._stream.subscribe_trade_updates(handler)
         self._stream_task = asyncio.create_task(self._run_stream(), name="alpaca-trade-updates")

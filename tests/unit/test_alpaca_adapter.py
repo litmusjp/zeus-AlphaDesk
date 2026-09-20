@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from alpaca.common.exceptions import APIError
 
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.domain.broker import (
@@ -87,6 +88,9 @@ class FakeTradingClient:
         assert request is not None
         return [raw_order()]
 
+    def get_clock(self) -> SimpleNamespace:
+        return SimpleNamespace(is_open=True)
+
     def cancel_order_by_id(self, order_id: str) -> None:
         assert order_id == "order-1"
 
@@ -96,6 +100,15 @@ class FakeTradingClient:
 
     def close_position(self, symbol_or_asset_id: str) -> SimpleNamespace:
         assert symbol_or_asset_id == "NVDA260918C00120000"
+        return raw_order()
+
+
+class DuplicateTradingClient(FakeTradingClient):
+    def submit_order(self, request: object) -> SimpleNamespace:
+        raise APIError('{"code":42210000,"message":"client order id already exists"}')
+
+    def get_order_by_client_id(self, client_order_id: str) -> SimpleNamespace:
+        assert client_order_id == "ad-intent-1"
         return raw_order()
 
 
@@ -155,6 +168,28 @@ async def test_h3_submission_maps_internal_intent_to_atomic_mleg_request() -> No
     submitted_request = cast(Any, client.submitted_request)
     assert submitted_request.order_class.value == "mleg"
     assert len(submitted_request.legs) == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_client_order_id_reconciles_existing_order() -> None:
+    adapter = AlpacaPaperBrokerAdapter(
+        "paper-key",
+        "paper-secret",
+        trading_client=DuplicateTradingClient(),
+        trading_stream=FakeTradingStream(),
+    )
+    order = await adapter.submit_order(
+        OrderSubmission(
+            client_order_id="ad-intent-1",
+            quantity=1,
+            limit_price="3.30",
+            legs=(
+                SubmissionLeg(symbol="XYZ260925C00100000", side="buy", ratio=1),
+                SubmissionLeg(symbol="XYZ260925C00110000", side="sell", ratio=1),
+            ),
+        )
+    )
+    assert order.broker_order_id == "order-1"
 
 
 @pytest.mark.asyncio

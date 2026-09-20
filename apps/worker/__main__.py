@@ -14,6 +14,7 @@ from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import ReconciliationService
 from packages.configuration.settings import get_settings
+from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.market_clock import AlpacaMarketClockAdapter
 from packages.connected.opportunities import (
     ConnectedOpportunityService,
@@ -286,6 +287,7 @@ async def _pre_session_supervisor(
                     workspace.workspace_id,
                     str(secret["api_key_id"]),
                     str(secret["secret_key"]),
+                    policy=AssessmentPolicy.from_payload(workspace.assessment_policy),
                 )
                 run = await start_scan_run(
                     database.sessions,
@@ -382,6 +384,7 @@ async def _scanner_supervisor(
                     workspace.workspace_id,
                     str(secret["api_key_id"]),
                     str(secret["secret_key"]),
+                    policy=AssessmentPolicy.from_payload(workspace.assessment_policy),
                 )
                 run = await start_scan_run(
                     database.sessions,

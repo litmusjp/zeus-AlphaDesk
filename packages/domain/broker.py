@@ -14,6 +14,7 @@ class OrderStatus(StrEnum):
     NEW = "new"
     ACCEPTED = "accepted"
     PENDING_NEW = "pending_new"
+    DONE_FOR_DAY = "done_for_day"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
     CANCELED = "canceled"
@@ -27,6 +28,7 @@ class BrokerAccount(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     account_id: str
+    environment: str = "PAPER"
     account_number: str
     status: str
     currency: str
@@ -45,6 +47,9 @@ class BrokerPosition(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     asset_id: str
+    broker_account_id: str | None = None
+    environment: str | None = None
+    identity_validated_at: datetime | None = None
     symbol: str
     asset_class: str
     side: str
@@ -91,6 +96,7 @@ class BrokerOrder(BaseModel):
     legs: tuple[BrokerOrderLeg, ...] = ()
     broker_account_id: str | None = None
     environment: str | None = None
+    identity_validated_at: datetime | None = None
 
 
 class BrokerTradeUpdate(BaseModel):

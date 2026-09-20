@@ -4,13 +4,36 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.database.models import AuditRecord, ConditionalApprovalRecord
+from packages.broker.validation import validate_broker_order_leg_identity
+from packages.database.models import AuditRecord, ConditionalApprovalRecord, WorkspaceRecord
 from packages.database.session import Database
 from packages.domain.broker import BrokerOrder
 from packages.execution.conditional_approval import ApprovalState
+from packages.execution.order_state import BrokerFillState, broker_fill_state
+
+
+def _submission_lease_is_stale(record: object, cutoff: datetime) -> bool:
+    """Return whether recovery may reclaim a submission lease.
+
+    Submission recovery is fenced by its own timestamp.  The revalidation
+    lease may be much older while the worker is actively between authorization
+    and the provider boundary, so it is not a valid recovery clock.
+    """
+
+    if getattr(record, "state", None) == ApprovalState.DISPATCH_AUTHORIZED:
+        return False
+    claimed_at = getattr(record, "submission_claimed_at", None)
+    return claimed_at is None or claimed_at <= cutoff
+
+
+def _dispatch_authorization_is_current(
+    *, state: ApprovalState, expires_at: datetime, now: datetime
+) -> bool:
+    """Return whether the provider-bound approval is still live."""
+    return state is ApprovalState.SUBMITTING and expires_at > now
 
 
 def _finish_transition_allowed(current: ApprovalState, target: ApprovalState) -> bool:
@@ -50,6 +73,24 @@ def _finish_transition_allowed(current: ApprovalState, target: ApprovalState) ->
             ApprovalState.BROKER_REJECTED,
             ApprovalState.SUBMISSION_UNCERTAIN,
         }
+    if current is ApprovalState.SUBMITTING:
+        return target in {
+            ApprovalState.DISPATCH_AUTHORIZED,
+            ApprovalState.SUBMITTED,
+            ApprovalState.PARTIALLY_FILLED,
+            ApprovalState.FILLED,
+            ApprovalState.BROKER_REJECTED,
+            ApprovalState.SUBMISSION_UNCERTAIN,
+            ApprovalState.CONDITION_FAILED,
+        }
+    if current is ApprovalState.DISPATCH_AUTHORIZED:
+        return target in {
+            ApprovalState.SUBMITTED,
+            ApprovalState.PARTIALLY_FILLED,
+            ApprovalState.FILLED,
+            ApprovalState.BROKER_REJECTED,
+            ApprovalState.SUBMISSION_UNCERTAIN,
+        }
     if current is ApprovalState.PARTIALLY_FILLED:
         return target in {ApprovalState.FILLED, ApprovalState.BROKER_REJECTED}
     if current is ApprovalState.SUBMITTED:
@@ -74,6 +115,8 @@ def _broker_evidence_is_valid(
     broker_order: BrokerOrder | None,
 ) -> bool:
     if broker_order is None:
+        return False
+    if validate_broker_order_leg_identity(broker_order) is not None:
         return False
     if not broker_order.broker_order_id or broker_order.client_order_id != record.client_order_id:
         return False
@@ -124,6 +167,19 @@ def _broker_evidence_is_valid(
             ):
                 return False
             leg_status = leg.status.lower()
+            if leg_status not in {
+                "new",
+                "accepted",
+                "pending_new",
+                "done_for_day",
+                "partially_filled",
+                "filled",
+                "rejected",
+                "canceled",
+                "expired",
+                "replaced",
+            }:
+                return False
             if leg_status == "filled" and leg.filled_quantity != leg_quantity:
                 return False
             if leg_status == "partially_filled" and not (
@@ -135,6 +191,26 @@ def _broker_evidence_is_valid(
             leg_fingerprints.append(f"{leg.symbol}:{leg.side}:{leg_quantity.normalize()}")
         fingerprint = "|".join(leg_fingerprints)
         if fingerprint != record.structure_fingerprint:
+            return False
+        if broker_order.filled_quantity == 0 and any(
+            leg.filled_quantity != 0 for leg in broker_order.legs
+        ):
+            return False
+        if Decimal("0") < broker_order.filled_quantity < quantity and any(
+            leg.quantity is None
+            or leg.filled_quantity != leg.quantity * broker_order.filled_quantity / quantity
+            for leg in broker_order.legs
+        ):
+            return False
+        if broker_order.filled_quantity == quantity and any(
+            leg.status.lower() not in {"filled", "canceled", "expired", "replaced"}
+            or leg.filled_quantity != leg.quantity
+            for leg in broker_order.legs
+        ):
+            return False
+        if Decimal("0") < broker_order.filled_quantity < quantity and any(
+            leg.status.lower() == "filled" for leg in broker_order.legs
+        ):
             return False
     if broker_order.limit_price is None or not broker_order.limit_price.is_finite():
         return False
@@ -175,21 +251,8 @@ def _broker_evidence_is_valid(
     ):
         return False
     status = broker_order.status.lower()
-    if status not in {
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "filled",
-        "rejected",
-        "canceled",
-        "expired",
-        "replaced",
-    }:
-        return False
-    if status == "filled" and filled != quantity:
-        return False
-    if status == "partially_filled" and not (Decimal("0") < filled < quantity):
+    fill_state = broker_fill_state(status, filled, quantity)
+    if fill_state is None:
         return False
     if target is ApprovalState.FILLED and filled != quantity:
         return False
@@ -197,32 +260,13 @@ def _broker_evidence_is_valid(
         return False
     if target is ApprovalState.BROKER_REJECTED and filled != 0:
         return False
-    if target is ApprovalState.SUBMITTED and (
-        status not in {"new", "accepted", "pending_new"} or filled != 0
-    ):
-        return False
-    if target is ApprovalState.FILLED and status not in {
-        "filled",
-        "canceled",
-        "rejected",
-        "expired",
-        "replaced",
-    }:
-        return False
-    if target is ApprovalState.PARTIALLY_FILLED and status not in {
-        "partially_filled",
-        "canceled",
-        "rejected",
-        "expired",
-        "replaced",
-    }:
-        return False
-    if target is ApprovalState.BROKER_REJECTED and status not in {
-        "rejected",
-        "canceled",
-        "expired",
-        "replaced",
-    }:
+    expected_state = {
+        BrokerFillState.SUBMITTED: ApprovalState.SUBMITTED,
+        BrokerFillState.PARTIALLY_FILLED: ApprovalState.PARTIALLY_FILLED,
+        BrokerFillState.FILLED: ApprovalState.FILLED,
+        BrokerFillState.BROKER_REJECTED: ApprovalState.BROKER_REJECTED,
+    }[fill_state]
+    if target is not expected_state:
         return False
     return True
 
@@ -470,7 +514,8 @@ class ConditionalApprovalStore:
                 ApprovalState.FILLED,
                 ApprovalState.BROKER_REJECTED,
             } and not _broker_evidence_is_valid(record, state, broker_order):
-                return
+                state = ApprovalState.SUBMISSION_UNCERTAIN
+                reason = reason or "broker_evidence_invalid"
             record.state = state
             if current_state is not state or reason is not None:
                 record.failure_reason = reason
@@ -511,9 +556,14 @@ class ConditionalApprovalStore:
 
     async def authorize_submission(
         self, approval_id: UUID, *, workspace_id: UUID, now: datetime, claim_token: UUID
-    ) -> bool:
+    ) -> UUID | None:
         """Atomically authorize a claimed approval immediately before broker submission."""
         async with self._database.sessions.begin() as session:
+            workspace = await session.scalar(
+                select(WorkspaceRecord)
+                .where(WorkspaceRecord.workspace_id == workspace_id)
+                .with_for_update()
+            )
             record = await session.scalar(
                 select(ConditionalApprovalRecord)
                 .where(
@@ -523,8 +573,39 @@ class ConditionalApprovalStore:
                 )
                 .with_for_update()
             )
-            if record is None or record.state != ApprovalState.REVALIDATING:
-                return False
+            competing = list(
+                await session.scalars(
+                    select(ConditionalApprovalRecord.approval_id).where(
+                        ConditionalApprovalRecord.workspace_id == workspace_id,
+                        ConditionalApprovalRecord.approval_kind == "OPEN",
+                        ConditionalApprovalRecord.approval_id != approval_id,
+                        ConditionalApprovalRecord.state.in_(
+                            (
+                                ApprovalState.REVALIDATING,
+                                ApprovalState.SUBMITTING,
+                                ApprovalState.DISPATCH_AUTHORIZED,
+                            )
+                        ),
+                    )
+                )
+            )
+            if (
+                workspace is None
+                or record is None
+                or competing
+                or record.state != ApprovalState.REVALIDATING
+                or workspace.updated_at > record.approved_at
+            ):
+                if (
+                    record is not None
+                    and record.state == ApprovalState.REVALIDATING
+                    and workspace is not None
+                    and workspace.updated_at > record.approved_at
+                ):
+                    record.state = ApprovalState.CONDITION_FAILED
+                    record.failure_reason = "assessment_policy_updated"
+                    record.updated_at = datetime.now(UTC)
+                return None
             effective_now = datetime.now(UTC)
             if record.expires_at <= effective_now:
                 record.state = ApprovalState.EXPIRED
@@ -540,20 +621,91 @@ class ConditionalApprovalStore:
                         occurred_at=effective_now,
                     )
                 )
-                return False
-            record.state = ApprovalState.READY_TO_SUBMIT
+                return None
+            record.state = ApprovalState.SUBMITTING
+            record.submission_claimed_at = effective_now
+            record.submission_token = uuid4()
             record.updated_at = effective_now
             session.add(
                 AuditRecord(
                     audit_id=uuid4(),
                     workspace_id=record.workspace_id,
                     actor_user_id=None,
-                    action="CONDITIONAL_APPROVAL_READY_TO_SUBMIT",
+                    action="CONDITIONAL_APPROVAL_SUBMITTING",
                     detail={"approval_id": str(record.approval_id)},
                     occurred_at=effective_now,
                 )
             )
+            return record.submission_token
+
+    async def authorize_final_submission(
+        self,
+        approval_id: UUID,
+        *,
+        workspace_id: UUID,
+        submission_token: UUID,
+    ) -> bool:
+        """Atomically fence the provider boundary for the claimed submission.
+
+        This is deliberately one database compare-and-swap.  A worker must still
+        hold the current workspace-scoped token and SUBMITTING state at the
+        instant this transaction commits; a later provider call is authorized
+        only by this successful transition, never by a preceding read.
+        """
+        authorized_at = datetime.now(UTC)
+        statement = (
+            update(ConditionalApprovalRecord)
+            .where(
+                ConditionalApprovalRecord.workspace_id == workspace_id,
+                exists(
+                    select(1).where(
+                        WorkspaceRecord.workspace_id == workspace_id,
+                        WorkspaceRecord.status == "ACTIVE",
+                    )
+                ),
+                ConditionalApprovalRecord.approval_id == approval_id,
+                ConditionalApprovalRecord.submission_token == submission_token,
+                ConditionalApprovalRecord.state == ApprovalState.SUBMITTING,
+                ConditionalApprovalRecord.expires_at > authorized_at,
+            )
+            .values(
+                state=ApprovalState.DISPATCH_AUTHORIZED,
+                dispatch_authorized_at=authorized_at,
+                updated_at=authorized_at,
+            )
+            .returning(ConditionalApprovalRecord.approval_id)
+        )
+        async with self._database.sessions.begin() as session:
+            authorized_id = await session.scalar(statement)
+            if authorized_id is None:
+                return False
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=workspace_id,
+                    actor_user_id=None,
+                    action="CONDITIONAL_APPROVAL_DISPATCH_AUTHORIZED",
+                    detail={"approval_id": str(approval_id)},
+                    occurred_at=authorized_at,
+                )
+            )
             return True
+
+    async def list_dispatch_authorized(
+        self, *, workspace_id: UUID, approval_kind: str
+    ) -> list[ConditionalApprovalRecord]:
+        async with self._database.sessions() as session:
+            return list(
+                await session.scalars(
+                    select(ConditionalApprovalRecord)
+                    .where(
+                        ConditionalApprovalRecord.workspace_id == workspace_id,
+                        ConditionalApprovalRecord.approval_kind == approval_kind,
+                        ConditionalApprovalRecord.state == ApprovalState.DISPATCH_AUTHORIZED,
+                    )
+                    .order_by(ConditionalApprovalRecord.created_at)
+                )
+            )
 
     async def list_ready_to_submit(
         self, *, workspace_id: UUID, approval_kind: str
@@ -572,6 +724,47 @@ class ConditionalApprovalStore:
                     .order_by(ConditionalApprovalRecord.created_at)
                 )
             )
+
+    async def list_stale_submitting(
+        self, *, workspace_id: UUID, approval_kind: str, now: datetime
+    ) -> list[ConditionalApprovalRecord]:
+        cutoff = now - self.REVALIDATION_LEASE
+        async with self._database.sessions.begin() as session:
+            records = list(
+                await session.scalars(
+                    select(ConditionalApprovalRecord)
+                    .where(
+                        ConditionalApprovalRecord.workspace_id == workspace_id,
+                        ConditionalApprovalRecord.approval_kind == approval_kind,
+                        ConditionalApprovalRecord.state == ApprovalState.SUBMITTING,
+                        (ConditionalApprovalRecord.submission_claimed_at <= cutoff)
+                        | ConditionalApprovalRecord.submission_claimed_at.is_(None),
+                    )
+                    .with_for_update(skip_locked=True)
+                    .order_by(ConditionalApprovalRecord.created_at)
+                )
+            )
+            for record in records:
+                if (
+                    record.claim_token is None
+                    or record.submission_token is None
+                    or record.submission_claimed_at is None
+                ):
+                    record.state = ApprovalState.SUBMISSION_UNCERTAIN
+                    record.failure_reason = (
+                        "submission_lease_missing"
+                        if record.submission_claimed_at is None
+                        else "recovery_claim_missing"
+                    )
+                else:
+                    # A stale SUBMITTING row cannot be proven to be before the
+                    # provider boundary.  Preserve the immutable client ID and
+                    # make it reconciliation-only; never rotate ownership into
+                    # a second submission attempt.
+                    record.state = ApprovalState.SUBMISSION_UNCERTAIN
+                    record.failure_reason = "stale_submission_requires_reconciliation"
+                record.updated_at = now
+            return records
 
     async def mark_unclaimable_recovery(
         self, *, workspace_id: UUID, approval_id: UUID, now: datetime

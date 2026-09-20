@@ -7,7 +7,9 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from packages.broker.adapter import BrokerPreflightFailed
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.connected.market_clock import AlpacaMarketClockAdapter
 from packages.database.models import ConditionalApprovalRecord
 from packages.database.session import Database
 from packages.execution.conditional_approval import (
@@ -18,6 +20,7 @@ from packages.execution.conditional_approval import (
     revalidate_exit_for_submission,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
+from packages.execution.order_state import BrokerFillState, broker_fill_state
 from packages.guardian.gate import GuardianExecutionGate
 from packages.guardian.store import PostgresGuardianStore
 from packages.options.alpaca_adapter import AlpacaOptionChainAdapter
@@ -36,35 +39,15 @@ class SubmissionAttempted(RuntimeError):
 def _broker_order_state(
     status: str, filled_quantity: Decimal = Decimal("0"), quantity: Decimal | None = None
 ) -> ApprovalState:
-    normalized_status = status.lower()
-    if normalized_status not in {
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "filled",
-        "rejected",
-        "canceled",
-        "expired",
-        "replaced",
-    }:
+    state = broker_fill_state(status, filled_quantity, quantity or Decimal("0"))
+    if state is None:
         return ApprovalState.SUBMISSION_UNCERTAIN
-    if normalized_status in {"new", "accepted", "pending_new"} and filled_quantity > 0:
-        return ApprovalState.SUBMISSION_UNCERTAIN
-    if quantity is not None and filled_quantity == quantity and filled_quantity > 0:
-        if normalized_status not in {"filled", "canceled", "rejected", "expired", "replaced"}:
-            return ApprovalState.SUBMISSION_UNCERTAIN
-        return ApprovalState.FILLED
-    if normalized_status in {"canceled", "rejected", "expired", "replaced"}:
-        return (
-            ApprovalState.PARTIALLY_FILLED if filled_quantity > 0 else ApprovalState.BROKER_REJECTED
-        )
     return {
-        "filled": ApprovalState.FILLED,
-        "partially_filled": ApprovalState.PARTIALLY_FILLED,
-        "expired": ApprovalState.BROKER_REJECTED,
-        "replaced": ApprovalState.BROKER_REJECTED,
-    }.get(status.lower(), ApprovalState.SUBMITTED)
+        BrokerFillState.SUBMITTED: ApprovalState.SUBMITTED,
+        BrokerFillState.PARTIALLY_FILLED: ApprovalState.PARTIALLY_FILLED,
+        BrokerFillState.FILLED: ApprovalState.FILLED,
+        BrokerFillState.BROKER_REJECTED: ApprovalState.BROKER_REJECTED,
+    }.get(state, ApprovalState.SUBMISSION_UNCERTAIN)
 
 
 def _close_order_matches(
@@ -145,6 +128,7 @@ def _close_fill_response_is_valid(order: object, quantity: int) -> bool:
         "new",
         "accepted",
         "pending_new",
+        "done_for_day",
         "partially_filled",
         "filled",
         "rejected",
@@ -155,11 +139,7 @@ def _close_fill_response_is_valid(order: object, quantity: int) -> bool:
         return False
     if status in {"new", "accepted", "pending_new"} and filled_decimal != 0:
         return False
-    if status == "filled":
-        return filled_decimal == Decimal(quantity)
-    if status == "partially_filled":
-        return Decimal("0") < filled_decimal < Decimal(quantity)
-    return True
+    return broker_fill_state(status, filled_decimal, Decimal(quantity)) is not None
 
 
 async def process_workspace_exit_approvals(
@@ -498,6 +478,7 @@ async def _process_claimed_exit(
         terminal_order_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
         if (
             record.approved_broker_account_id is None
+            or final_snapshot.account.environment != "PAPER"
             or final_snapshot.account.account_id != record.approved_broker_account_id
             or final_position is None
             or final_position.asset_class.lower() != "us_option"
@@ -592,10 +573,32 @@ async def _process_claimed_exit(
                 reason=f"guardian_blocked:{final_guardian_reason}",
             )
             return
-        if claim_token is None or not await store.authorize_submission(
-            record.approval_id, workspace_id=workspace_id, now=now, claim_token=claim_token
-        ):
+        submission_token = (
+            None
+            if claim_token is None
+            else await store.authorize_submission(
+                record.approval_id,
+                workspace_id=workspace_id,
+                now=now,
+                claim_token=claim_token,
+            )
+        )
+        if submission_token is None:
             return
+        try:
+            market_clock = await AlpacaMarketClockAdapter(
+                str(secret["api_key_id"]), str(secret["secret_key"])
+            ).get_clock()
+        except Exception as error:
+            raise PreSubmissionCheckFailed("authoritative_market_clock_unavailable") from error
+        if not market_clock.is_open:
+            raise PreSubmissionCheckFailed("market_session_closed")
+        if not await store.authorize_final_submission(
+            record.approval_id,
+            workspace_id=workspace_id,
+            submission_token=submission_token,
+        ):
+            raise PreSubmissionCheckFailed("approval_ownership_changed")
         try:
             submission_started[0] = True
             order = await broker.submit_close_limit(
@@ -605,6 +608,8 @@ async def _process_claimed_exit(
                 order_side=order_side,
                 client_order_id=record.client_order_id,
             )
+        except BrokerPreflightFailed as error:
+            raise PreSubmissionCheckFailed(str(error)) from error
         except Exception as error:
             raise SubmissionAttempted("close_submission_uncertain") from error
         if not _close_order_matches(
@@ -664,6 +669,12 @@ async def _recover_ready_to_submit(
     workspace_id: UUID,
 ) -> None:
     records = await store.list_ready_to_submit(workspace_id=workspace_id, approval_kind="CLOSE")
+    records += await store.list_stale_submitting(
+        workspace_id=workspace_id, approval_kind="CLOSE", now=datetime.now(UTC)
+    )
+    records += await store.list_dispatch_authorized(
+        workspace_id=workspace_id, approval_kind="CLOSE"
+    )
     if not records:
         return
     secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")

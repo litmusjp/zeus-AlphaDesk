@@ -7,6 +7,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from packages.broker.validation import (
+    validate_broker_account,
+    validate_broker_order,
+    validate_broker_position,
+)
 from packages.database.models import (
     BrokerAccountRecord,
     BrokerOrderRecord,
@@ -45,6 +50,9 @@ class BrokerProjectionStore(Protocol):
 def _order_values(order: BrokerOrder) -> dict[str, object]:
     return {
         "broker_order_id": order.broker_order_id,
+        "broker_account_id": order.broker_account_id,
+        "environment": order.environment,
+        "identity_validated_at": order.identity_validated_at,
         "client_order_id": order.client_order_id,
         "status": order.status,
         "asset_class": order.asset_class,
@@ -62,6 +70,21 @@ def _order_values(order: BrokerOrder) -> dict[str, object]:
         "updated_at": order.updated_at,
         "legs": [leg.model_dump(mode="json") for leg in order.legs],
     }
+
+
+def _snapshot_validation_error(snapshot: ReconciliationSnapshot) -> str | None:
+    reason = validate_broker_account(snapshot.account)
+    if reason is not None:
+        return reason
+    for position in snapshot.positions:
+        reason = validate_broker_position(position, snapshot.account)
+        if reason is not None:
+            return reason
+    for order in snapshot.open_orders:
+        reason = validate_broker_order(order, snapshot.account)
+        if reason is not None:
+            return reason
+    return None
 
 
 class PostgresBrokerProjectionStore:
@@ -100,6 +123,11 @@ class PostgresBrokerProjectionStore:
     async def apply_reconciliation(self, snapshot: ReconciliationSnapshot) -> int:
         async with self._sessions.begin() as session:
             state = await self._state_for_update(session)
+            validation_error = _snapshot_validation_error(snapshot)
+            if validation_error is not None:
+                state.state = BrokerState.UNKNOWN.value
+                state.failure_reason = "broker_evidence_invalid"
+                return 0
             current_position_ids = set(
                 await session.scalars(
                     select(BrokerPositionRecord.asset_id).where(
@@ -140,6 +168,7 @@ class PostgresBrokerProjectionStore:
                 BrokerAccountRecord(
                     workspace_id=self._workspace_id,
                     account_id=account.account_id,
+                    environment=account.environment,
                     account_number=account.account_number,
                     status=account.status,
                     currency=account.currency,
@@ -155,11 +184,21 @@ class PostgresBrokerProjectionStore:
                 )
             )
             session.add_all(
-                BrokerPositionRecord(workspace_id=self._workspace_id, **position.model_dump())
+                BrokerPositionRecord(
+                    workspace_id=self._workspace_id,
+                    **position.model_copy(
+                        update={"identity_validated_at": snapshot.reconciled_at}
+                    ).model_dump(),
+                )
                 for position in snapshot.positions
             )
             session.add_all(
-                BrokerOrderRecord(workspace_id=self._workspace_id, **_order_values(order))
+                BrokerOrderRecord(
+                    workspace_id=self._workspace_id,
+                    **_order_values(
+                        order.model_copy(update={"identity_validated_at": snapshot.reconciled_at})
+                    ),
+                )
                 for order in snapshot.open_orders
             )
             state.state = BrokerState.RECONCILED.value
@@ -170,7 +209,10 @@ class PostgresBrokerProjectionStore:
             return divergence_count
 
     async def apply_trade_update(self, update: BrokerTradeUpdate) -> None:
-        values = {"workspace_id": self._workspace_id, **_order_values(update.order)}
+        validated_order = update.order.model_copy(
+            update={"identity_validated_at": update.occurred_at}
+        )
+        values = {"workspace_id": self._workspace_id, **_order_values(validated_order)}
         statement = insert(BrokerOrderRecord).values(**values)
         statement = statement.on_conflict_do_update(
             index_elements=[
@@ -184,6 +226,54 @@ class PostgresBrokerProjectionStore:
             },
         )
         async with self._sessions.begin() as session:
+            account = await session.scalar(
+                select(BrokerAccountRecord).where(
+                    BrokerAccountRecord.workspace_id == self._workspace_id
+                )
+            )
+            if account is None:
+                state = await self._state_for_update(session)
+                state.state = BrokerState.UNKNOWN.value
+                state.failure_reason = "broker_evidence_invalid"
+                return
+            account_model = BrokerAccount(
+                account_id=account.account_id,
+                environment=account.environment,
+                account_number=account.account_number,
+                status=account.status,
+                currency=account.currency,
+                equity=account.equity,
+                cash=account.cash,
+                buying_power=account.buying_power,
+                options_buying_power=account.options_buying_power,
+                last_equity=account.last_equity,
+                trading_blocked=account.trading_blocked,
+                account_blocked=account.account_blocked,
+                trade_suspended_by_user=account.trade_suspended_by_user,
+                as_of=account.as_of,
+            )
+            if validate_broker_order(update.order, account_model) is not None:
+                state = await self._state_for_update(session)
+                state.state = BrokerState.UNKNOWN.value
+                state.failure_reason = "broker_evidence_invalid"
+                return
+            existing = await session.scalar(
+                select(BrokerOrderRecord)
+                .where(
+                    BrokerOrderRecord.workspace_id == self._workspace_id,
+                    BrokerOrderRecord.broker_order_id == update.order.broker_order_id,
+                )
+                .with_for_update()
+            )
+            if existing is not None and (
+                existing.client_order_id != update.order.client_order_id
+                or existing.broker_account_id != update.order.broker_account_id
+                or existing.environment != update.order.environment
+            ):
+                state = await self._state_for_update(session)
+                state.state = BrokerState.UNKNOWN.value
+                state.failure_reason = "broker_evidence_invalid"
+                return
             await session.execute(statement)
             state = await self._state_for_update(session)
             state.last_stream_event_at = update.occurred_at
@@ -215,6 +305,7 @@ class PostgresBrokerProjectionStore:
                 return None
             return BrokerAccount(
                 account_id=record.account_id,
+                environment=record.environment,
                 account_number=record.account_number,
                 status=record.status,
                 currency=record.currency,
@@ -239,6 +330,9 @@ class PostgresBrokerProjectionStore:
             return tuple(
                 BrokerPosition(
                     asset_id=item.asset_id,
+                    broker_account_id=item.broker_account_id,
+                    environment=item.environment,
+                    identity_validated_at=item.identity_validated_at,
                     symbol=item.symbol,
                     asset_class=item.asset_class,
                     side=item.side,
@@ -267,6 +361,9 @@ class PostgresBrokerProjectionStore:
     def _record_to_order(item: BrokerOrderRecord) -> BrokerOrder:
         return BrokerOrder(
             broker_order_id=item.broker_order_id,
+            broker_account_id=item.broker_account_id,
+            environment=item.environment,
+            identity_validated_at=item.identity_validated_at,
             client_order_id=item.client_order_id,
             status=item.status,
             asset_class=item.asset_class,
@@ -307,13 +404,27 @@ class MemoryBrokerProjectionStore:
         )
 
     async def apply_reconciliation(self, snapshot: ReconciliationSnapshot) -> int:
+        validation_error = _snapshot_validation_error(snapshot)
+        if validation_error is not None:
+            self.status = self.status.model_copy(
+                update={"state": BrokerState.UNKNOWN, "failure_reason": "broker_evidence_invalid"}
+            )
+            return 0
         divergence = len(set(self.positions) ^ {item.asset_id for item in snapshot.positions})
         divergence += len(
             set(self.orders) ^ {item.broker_order_id for item in snapshot.open_orders}
         )
         self.account = snapshot.account
-        self.positions = {item.asset_id: item for item in snapshot.positions}
-        self.orders = {item.broker_order_id: item for item in snapshot.open_orders}
+        self.positions = {
+            item.asset_id: item.model_copy(update={"identity_validated_at": snapshot.reconciled_at})
+            for item in snapshot.positions
+        }
+        self.orders = {
+            item.broker_order_id: item.model_copy(
+                update={"identity_validated_at": snapshot.reconciled_at}
+            )
+            for item in snapshot.open_orders
+        }
         self.status = BrokerSyncStatus(
             state=BrokerState.RECONCILED,
             last_reconciled_at=snapshot.reconciled_at,
@@ -324,7 +435,24 @@ class MemoryBrokerProjectionStore:
         return divergence
 
     async def apply_trade_update(self, update: BrokerTradeUpdate) -> None:
-        self.orders[update.order.broker_order_id] = update.order
+        if self.account is None or validate_broker_order(update.order, self.account) is not None:
+            self.status = self.status.model_copy(
+                update={"state": BrokerState.UNKNOWN, "failure_reason": "broker_evidence_invalid"}
+            )
+            return
+        existing = self.orders.get(update.order.broker_order_id)
+        if existing is not None and (
+            existing.client_order_id != update.order.client_order_id
+            or existing.broker_account_id != update.order.broker_account_id
+            or existing.environment != update.order.environment
+        ):
+            self.status = self.status.model_copy(
+                update={"state": BrokerState.UNKNOWN, "failure_reason": "broker_evidence_invalid"}
+            )
+            return
+        self.orders[update.order.broker_order_id] = update.order.model_copy(
+            update={"identity_validated_at": update.occurred_at}
+        )
         self.status = self.status.model_copy(
             update={"last_stream_event_at": update.occurred_at, "stream_connected": True}
         )

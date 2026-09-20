@@ -10,9 +10,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
+from packages.broker.validation import validate_broker_order_leg_identity
+from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
 from packages.connected.option_scan_policy import ScanMode
-from packages.database.models import ConnectedOpportunityRecord
+from packages.database.models import ConnectedOpportunityRecord, WorkspaceRecord
 from packages.database.session import Database
 from packages.domain.broker import BrokerOrder
 from packages.domain.workflow import OrderIntent, RankedCandidate
@@ -27,6 +29,7 @@ from packages.execution.conditional_approval import (
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.execution.connected_paper import execute_connected_paper_order
 from packages.execution.engine import ExecutionBlocked, SubmissionUncertain
+from packages.execution.order_state import BrokerFillState, broker_fill_state
 from packages.security.credentials import CredentialCipher
 from packages.security.store import CredentialStore
 
@@ -87,38 +90,22 @@ def _intent_matches_approved(candidate: OrderIntent, approved: OrderIntent) -> b
 
 
 def _open_order_state(order: BrokerOrder) -> ApprovalState:
-    status = order.status.lower()
-    if status not in {
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "filled",
-        "rejected",
-        "canceled",
-        "expired",
-        "replaced",
-    }:
+    if order.quantity is None:
         return ApprovalState.SUBMISSION_UNCERTAIN
-    if status in {"new", "accepted", "pending_new"} and order.filled_quantity != 0:
+    state = broker_fill_state(order.status, order.filled_quantity, order.quantity)
+    if state is None:
         return ApprovalState.SUBMISSION_UNCERTAIN
-    if order.quantity is not None and order.filled_quantity == order.quantity:
-        if status not in {"filled", "canceled", "rejected", "expired", "replaced"}:
-            return ApprovalState.SUBMISSION_UNCERTAIN
-        return ApprovalState.FILLED
-    if status in {"canceled", "rejected", "expired", "replaced"} and order.filled_quantity > 0:
-        return ApprovalState.PARTIALLY_FILLED
     return {
-        "filled": ApprovalState.FILLED,
-        "partially_filled": ApprovalState.PARTIALLY_FILLED,
-        "expired": ApprovalState.BROKER_REJECTED,
-        "replaced": ApprovalState.BROKER_REJECTED,
-        "rejected": ApprovalState.BROKER_REJECTED,
-        "canceled": ApprovalState.BROKER_REJECTED,
-    }.get(status, ApprovalState.SUBMITTED)
+        BrokerFillState.SUBMITTED: ApprovalState.SUBMITTED,
+        BrokerFillState.PARTIALLY_FILLED: ApprovalState.PARTIALLY_FILLED,
+        BrokerFillState.FILLED: ApprovalState.FILLED,
+        BrokerFillState.BROKER_REJECTED: ApprovalState.BROKER_REJECTED,
+    }.get(state, ApprovalState.SUBMISSION_UNCERTAIN)
 
 
 def _open_fill_response_is_valid(order: BrokerOrder) -> bool:
+    if validate_broker_order_leg_identity(order) is not None:
+        return False
     if (
         order.quantity is None
         or not order.quantity.is_finite()
@@ -132,6 +119,7 @@ def _open_fill_response_is_valid(order: BrokerOrder) -> bool:
         "new",
         "accepted",
         "pending_new",
+        "done_for_day",
         "partially_filled",
         "filled",
         "rejected",
@@ -152,10 +140,48 @@ def _open_fill_response_is_valid(order: BrokerOrder) -> bool:
         or order.filled_average_price <= 0
     ):
         return False
-    if status == "filled":
-        return order.filled_quantity == order.quantity
-    if status == "partially_filled":
-        return Decimal("0") < order.filled_quantity < order.quantity
+    if broker_fill_state(status, order.filled_quantity, order.quantity) is None:
+        return False
+    known_leg_statuses = {
+        "new",
+        "accepted",
+        "pending_new",
+        "done_for_day",
+        "partially_filled",
+        "filled",
+        "rejected",
+        "canceled",
+        "expired",
+        "replaced",
+    }
+    for leg in order.legs:
+        if leg.status.lower() not in known_leg_statuses:
+            return False
+        if not leg.filled_quantity.is_finite() or leg.filled_quantity < 0:
+            return False
+        if leg.quantity is not None and (
+            not leg.quantity.is_finite() or leg.quantity <= 0 or leg.filled_quantity > leg.quantity
+        ):
+            return False
+    if order.filled_quantity == 0 and any(leg.filled_quantity != 0 for leg in order.legs):
+        return False
+    if Decimal("0") < order.filled_quantity < order.quantity and any(
+        leg.quantity is None
+        or leg.filled_quantity != leg.quantity * order.filled_quantity / order.quantity
+        for leg in order.legs
+    ):
+        return False
+    if order.filled_quantity == order.quantity and any(
+        leg.status.lower() not in {"filled", "canceled", "expired", "replaced"}
+        or leg.quantity is None
+        or leg.filled_quantity != leg.quantity
+        for leg in order.legs
+    ):
+        return False
+    if Decimal("0") < order.filled_quantity < order.quantity and any(
+        leg.status.lower() == "filled" for leg in order.legs
+    ):
+        return False
     return True
 
 
@@ -213,6 +239,11 @@ async def process_workspace_approvals(
                         ConnectedOpportunityRecord.opportunity_id == approval_record.opportunity_id,
                     )
                 )
+                workspace_policy = await session.scalar(
+                    select(WorkspaceRecord.assessment_policy).where(
+                        WorkspaceRecord.workspace_id == workspace_id
+                    )
+                )
             if original_record is None:
                 await _finish(
                     approval_record.approval_id,
@@ -248,6 +279,7 @@ async def process_workspace_approvals(
                 workspace_id,
                 str(secret["api_key_id"]),
                 str(secret["secret_key"]),
+                policy=AssessmentPolicy.from_payload(workspace_policy or {}),
             )
             fresh = await service.analyze(
                 original.symbol,
@@ -363,12 +395,17 @@ async def process_workspace_approvals(
                 )
                 continue
             now = datetime.now(UTC)
-            if claim_token is None or not await store.authorize_submission(
-                approval_record.approval_id,
-                workspace_id=workspace_id,
-                now=now,
-                claim_token=claim_token,
-            ):
+            submission_token = (
+                None
+                if claim_token is None
+                else await store.authorize_submission(
+                    approval_record.approval_id,
+                    workspace_id=workspace_id,
+                    now=now,
+                    claim_token=claim_token,
+                )
+            )
+            if submission_token is None:
                 continue
             submission_started = True
             broker_order = await execute_connected_paper_order(
@@ -378,6 +415,10 @@ async def process_workspace_approvals(
                 candidate=fresh_candidate,
                 intent=fresh_intent,
                 approved_broker_account_id=approval_record.approved_broker_account_id,
+                policy=service.policy,
+                approval_id=approval_record.approval_id,
+                claim_token=claim_token,
+                submission_token=submission_token,
             )
             if not _open_order_matches(
                 broker_order,
@@ -450,6 +491,10 @@ async def _recover_ready_to_submit(
     workspace_id: UUID,
 ) -> None:
     records = await store.list_ready_to_submit(workspace_id=workspace_id, approval_kind="OPEN")
+    records += await store.list_stale_submitting(
+        workspace_id=workspace_id, approval_kind="OPEN", now=datetime.now(UTC)
+    )
+    records += await store.list_dispatch_authorized(workspace_id=workspace_id, approval_kind="OPEN")
     if not records:
         return
     secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, "ALPACA")

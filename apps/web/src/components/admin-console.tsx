@@ -1,17 +1,16 @@
 "use client";
 
 import {
-  ArrowRight,
-  CheckCircle2,
   Database,
   LockKeyhole,
   ShieldCheck,
   Star,
 } from "lucide-react";
-import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import { deskFetch, IdentityView } from "@/lib/api";
+import { AgentApiPage } from "./agent-api";
+import { CredentialSettings } from "./credential-settings";
 
 type ProvisionedWorkspace = {
   workspace_id: string;
@@ -61,19 +60,13 @@ export function AdminConsole() {
 
   const hasWorkspace = Boolean(identity.workspace_id || workspace);
   return (
-    <div className="admin-console-grid">
-      <section className="admin-provision-panel control-panel">
+    <div className="admin-console-sections">
+      <section className="admin-provision-panel control-panel" aria-labelledby="admin-access-heading">
         <div className="admin-access-heading">
           <span><ShieldCheck /></span>
-          <div><small>ADMINISTRATOR ACCESS</small><h2>Active</h2><p>Signed in with protected platform-administration rights.</p></div>
+          <div><small>ADMINISTRATOR ACCESS</small><h2 id="admin-access-heading">Active</h2><p>Signed in with protected platform-administration rights.</p></div>
         </div>
-        {hasWorkspace ? (
-          <div className="admin-workspace-ready">
-            <CheckCircle2 />
-            <div><small>CONNECTED PAPER WORKSPACE</small><h3>Provisioned</h3><p>Status: {workspace?.status ?? identity.workspace_status}. Your existing Supabase identity remains the owner.</p></div>
-            <Link className="primary-link" href="/desk/settings">Continue setup <ArrowRight /></Link>
-          </div>
-        ) : (
+        {!hasWorkspace ? (
           <>
             <div className="admin-provision-copy"><h2>Create your Paper Workspace</h2><p>No Connected Paper Workspace has been provisioned for this account. Create a tenant-isolated workspace to enable operator controls.</p></div>
             <ul className="admin-provision-list">
@@ -84,16 +77,17 @@ export function AdminConsole() {
             </ul>
             <button className="admin-provision-button" disabled={busy} onClick={provision}><LockKeyhole/>{busy ? "Creating workspace…" : "Create my Paper Workspace"}</button>
           </>
-        )}
+        ) : null}
         {message ? <p className="form-message" role="status">{message}</p> : null}
       </section>
-      <aside className={`admin-workspace-state control-panel ${hasWorkspace ? "ready" : "inactive"}`}>
-        <div><small>CONNECTED PAPER WORKSPACE</small><span className={`status-pill ${hasWorkspace ? "good" : ""}`}>{hasWorkspace ? "ACTIVE" : "NOT PROVISIONED"}</span></div>
-        <LockKeyhole />
-        <h2>{hasWorkspace ? "Ready for provider setup" : "Inactive until provisioned"}</h2>
-        <p>{hasWorkspace ? "Add your Alpaca paper and OpenRouter credentials to complete onboarding." : "Operator controls, market data streams, and paper execution remain unavailable until this workspace is created."}</p>
-        {hasWorkspace ? <Link className="secondary-link" href="/desk">Open Workspace Control <ArrowRight /></Link> : null}
-      </aside>
+      <section className="admin-console-section" aria-labelledby="credential-settings-heading">
+        <h2 id="credential-settings-heading">Credential Settings</h2>
+        <CredentialSettings />
+      </section>
+      <section className="admin-console-section" aria-labelledby="agent-api-heading">
+        <h2 id="agent-api-heading">Agent API &amp; MCP</h2>
+        <AgentApiPage />
+      </section>
     </div>
   );
 }

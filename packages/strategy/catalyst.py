@@ -44,10 +44,15 @@ def score_signal(features: CatalystFeatures) -> Decimal:
 
 class CatalystMomentumStrategy:
     def __init__(
-        self, *, minimum_score: Decimal = Decimal("65"), maximum_gap: Decimal = Decimal("12")
+        self,
+        *,
+        minimum_score: Decimal = Decimal("65"),
+        maximum_gap: Decimal = Decimal("12"),
+        minimum_catalyst_confidence: Decimal = Decimal("0.60"),
     ) -> None:
         self._minimum_score = minimum_score
         self._maximum_gap = maximum_gap
+        self._minimum_catalyst_confidence = minimum_catalyst_confidence
 
     def evaluate_signal(self, signal: Signal) -> TradeIdea | NoTrade:
         reasons: list[str] = []
@@ -61,7 +66,7 @@ class CatalystMomentumStrategy:
         )
         if directional_momentum <= 0:
             reasons.append("price_action_not_confirming")
-        if signal.features.catalyst_confidence < Decimal("0.60"):
+        if signal.features.catalyst_confidence < self._minimum_catalyst_confidence:
             reasons.append("weak_catalyst_confidence")
         if reasons:
             return NoTrade(signal_id=signal.signal_id, reason_codes=tuple(reasons))

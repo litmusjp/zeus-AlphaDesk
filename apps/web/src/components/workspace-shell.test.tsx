@@ -27,7 +27,11 @@ describe("WorkspaceShell admin navigation", () => {
     render(<WorkspaceShell title="Admin" description="Console"><div>Body</div></WorkspaceShell>);
 
     expect(await screen.findByRole("link", { name: /Admin Console/ })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /Access & Invitations/ })).toBeInTheDocument();
-    expect(screen.getByText("Workspace Control").closest("span")).toHaveAttribute("aria-disabled", "true");
+    const navigation = screen.getByRole("navigation", { name: "connected paper workspace navigation" });
+    const links = Array.from(navigation.querySelectorAll("a")).map((link) => link.textContent?.trim());
+    expect(links).toEqual(["Admin Console", "Access & Invitations", "Candidate Assessment", "Audit & Guardian"]);
+    expect(screen.queryByRole("link", { name: /Credential Settings/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Agent API & MCP/ })).not.toBeInTheDocument();
+    expect(screen.getByText("Workspace Dashboard").closest("span")).toHaveAttribute("aria-disabled", "true");
   });
 });

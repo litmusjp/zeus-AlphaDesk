@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
+from packages.connected.assessment_policy import AssessmentPolicy
 from packages.domain.options import EligibilityResult, LiquidityPolicy, OptionContract, OptionType
 from packages.options.liquidity import evaluate_contract
 
@@ -30,15 +31,23 @@ class OptionScanSelection:
     diagnostics: OptionScanDiagnostics
 
 
-def _policy(*, pre_scan: bool, underlying_symbol: str) -> LiquidityPolicy:
+def _policy(*, pre_scan: bool, underlying_symbol: str, policy: AssessmentPolicy) -> LiquidityPolicy:
     return LiquidityPolicy(
         supported_underlyings=frozenset({underlying_symbol}),
-        min_dte=14,
-        max_dte=45,
-        max_spread_ratio=Decimal("1.00") if pre_scan else Decimal("0.20"),
-        min_open_interest=None if pre_scan else 25,
-        max_quote_age_seconds=86400 if pre_scan else 120,
-        require_greeks=True,
+        min_dte=policy.minimum_dte,
+        max_dte=policy.maximum_dte,
+        max_spread_ratio=policy.pre_scan_max_spread_ratio
+        if pre_scan
+        else policy.execution_max_spread_ratio,
+        min_open_interest=policy.pre_scan_min_open_interest
+        if pre_scan
+        else policy.execution_min_open_interest,
+        max_quote_age_seconds=policy.pre_scan_max_quote_age_seconds
+        if pre_scan
+        else policy.execution_max_quote_age_seconds,
+        min_quote_size=policy.minimum_quote_size,
+        max_strike_distance_ratio=policy.maximum_strike_distance_ratio,
+        require_greeks=policy.require_greeks,
     )
 
 
@@ -49,12 +58,15 @@ def select_contracts(
     wanted_type: OptionType,
     as_of: datetime,
     mode: ScanMode,
+    policy: AssessmentPolicy | None = None,
 ) -> OptionScanSelection:
+    policy = policy or AssessmentPolicy()
     underlying_symbol = contracts[0].underlying_symbol if contracts else ""
-    strict_policy = _policy(pre_scan=False, underlying_symbol=underlying_symbol)
+    strict_policy = _policy(pre_scan=False, underlying_symbol=underlying_symbol, policy=policy)
     selection_policy = _policy(
         pre_scan=mode is ScanMode.PRE_SCAN,
         underlying_symbol=underlying_symbol,
+        policy=policy,
     )
     rejection_counts: Counter[str] = Counter()
     requested_type_contracts = 0

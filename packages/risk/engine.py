@@ -41,6 +41,7 @@ class RiskContext(BaseModel):
     portfolio_gamma: Decimal = Decimal("0")
     portfolio_theta: Decimal = Decimal("0")
     portfolio_vega: Decimal = Decimal("0")
+    portfolio_greeks_available: bool = True
     broker_execution_allowed: bool
     duplicate_logical_order: bool = False
 
@@ -99,7 +100,8 @@ class RiskEngine:
             ),
             RiskCheck(
                 name="greeks",
-                passed=(
+                passed=context.portfolio_greeks_available
+                and (
                     abs(context.portfolio_delta + impact.delta)
                     <= self.policy.max_abs_portfolio_delta
                     and abs(context.portfolio_gamma + impact.gamma)

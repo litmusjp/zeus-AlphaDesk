@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
+from packages.connected.assessment_policy import AssessmentPolicy, position_exposure
 from packages.connected.option_scan_policy import ScanMode, select_contracts
 from packages.database.models import ConnectedOpportunityRecord, ConnectedScanRunRecord
 from packages.domain.options import LegSide, OptionLeg, OptionType, StructureType
@@ -26,7 +27,7 @@ from packages.options.alpaca_adapter import (
     OptionChainQuery,
 )
 from packages.options.engine import build_structure
-from packages.risk.engine import RiskContext, RiskEngine, RiskPolicy
+from packages.risk.engine import RiskContext, RiskEngine
 from packages.strategy.catalyst import CatalystMomentumStrategy, score_signal
 
 POSITIVE_WORDS = frozenset(
@@ -116,6 +117,22 @@ def _scan_disposition(
     return "RISK_REJECTED"
 
 
+def _strategy_for_mode(mode: ScanMode, policy: AssessmentPolicy) -> CatalystMomentumStrategy:
+    return CatalystMomentumStrategy(
+        minimum_score=(
+            policy.pre_scan_minimum_signal_score
+            if mode is ScanMode.PRE_SCAN
+            else policy.minimum_signal_score
+        ),
+        maximum_gap=policy.maximum_gap_percent,
+        minimum_catalyst_confidence=(
+            policy.pre_scan_minimum_catalyst_confidence
+            if mode is ScanMode.PRE_SCAN
+            else policy.minimum_catalyst_confidence
+        ),
+    )
+
+
 class ConnectedOpportunityService:
     """Builds Catalyst opportunities exclusively from live Alpaca responses."""
 
@@ -125,12 +142,18 @@ class ConnectedOpportunityService:
         workspace_id: UUID,
         api_key: str,
         secret_key: str,
+        policy: AssessmentPolicy | None = None,
     ) -> None:
         self._sessions = sessions
         self._workspace_id = workspace_id
         self._stock = StockHistoricalDataClient(api_key, secret_key)
         self._news = NewsClient(api_key, secret_key)
         self._options = AlpacaOptionChainAdapter(api_key, secret_key)
+        self._policy = policy or AssessmentPolicy()
+
+    @property
+    def policy(self) -> AssessmentPolicy:
+        return self._policy
 
     def _features(self, symbol: str) -> tuple[CatalystFeatures, Decimal, datetime]:
         now = datetime.now(UTC)
@@ -232,7 +255,7 @@ class ConnectedOpportunityService:
                 "options": "alpaca-real-v1",
             },
         )
-        strategy = CatalystMomentumStrategy()
+        strategy = _strategy_for_mode(mode, self._policy)
         idea = strategy.evaluate_signal(signal)
         opportunity_id = uuid4()
         expires_at = now + (
@@ -255,10 +278,12 @@ class ConnectedOpportunityService:
         contracts, fetch_diagnostics = await self._options.get_chain_with_diagnostics(
             OptionChainQuery(
                 underlying_symbol=normalized,
-                expiration_date_gte=date.today() + timedelta(days=14),
-                expiration_date_lte=date.today() + timedelta(days=45),
-                strike_price_gte=underlying_price * Decimal("0.85"),
-                strike_price_lte=underlying_price * Decimal("1.15"),
+                expiration_date_gte=date.today() + timedelta(days=self._policy.minimum_dte),
+                expiration_date_lte=date.today() + timedelta(days=self._policy.maximum_dte),
+                strike_price_gte=underlying_price
+                * (Decimal("1") - self._policy.maximum_strike_distance_ratio),
+                strike_price_lte=underlying_price
+                * (Decimal("1") + self._policy.maximum_strike_distance_ratio),
             )
         )
         wanted_type = OptionType.CALL if idea.direction == "BULLISH" else OptionType.PUT
@@ -268,6 +293,7 @@ class ConnectedOpportunityService:
             wanted_type=wanted_type,
             as_of=now,
             mode=mode,
+            policy=self._policy,
         )
         eligible = list(selection.selected)
         option_diagnostics = {
@@ -284,6 +310,7 @@ class ConnectedOpportunityService:
                 "no_eligible_option_chain",
                 scan_run_id=scan_run_id,
                 option_diagnostics=option_diagnostics,
+                mode=mode,
             )
         selected = sorted(
             (item for item in eligible if item.expiration == expirations[0]),
@@ -298,6 +325,7 @@ class ConnectedOpportunityService:
                 "insufficient_vertical_legs",
                 scan_run_id=scan_run_id,
                 option_diagnostics=option_diagnostics,
+                mode=mode,
             )
         if wanted_type is OptionType.CALL:
             long_index = min(
@@ -316,6 +344,26 @@ class ConnectedOpportunityService:
             long_contract, short_contract = selected[long_index], selected[long_index - 1]
             structure_type = StructureType.BEAR_PUT_DEBIT_SPREAD
         try:
+            debit_per_share = long_contract.quote.ask - short_contract.quote.bid
+            one_contract_cost = debit_per_share * Decimal(long_contract.multiplier)
+            quantity = min(
+                self._policy.maximum_contracts_per_candidate,
+                int(
+                    self._policy.max_investment_per_candidate
+                    / max(one_contract_cost, Decimal("0.01"))
+                ),
+            )
+            if quantity < 1:
+                return await self._unavailable(
+                    opportunity_id,
+                    signal,
+                    idea,
+                    now,
+                    "investment_cap_below_one_contract",
+                    scan_run_id=scan_run_id,
+                    option_diagnostics=option_diagnostics,
+                    mode=mode,
+                )
             structure = build_structure(
                 structure_type,
                 (
@@ -330,6 +378,7 @@ class ConnectedOpportunityService:
                         entry_price=short_contract.quote.bid,
                     ),
                 ),
+                quantity=quantity,
             )
         except ValueError:
             return await self._unavailable(
@@ -340,6 +389,7 @@ class ConnectedOpportunityService:
                 "invalid_option_structure",
                 scan_run_id=scan_run_id,
                 option_diagnostics=option_diagnostics,
+                mode=mode,
             )
         strict_selection = select_contracts(
             tuple(contracts),
@@ -347,6 +397,7 @@ class ConnectedOpportunityService:
             wanted_type=wanted_type,
             as_of=now,
             mode=ScanMode.EXECUTION,
+            policy=self._policy,
         )
         strict_contract_ids = {item.contract_id for item in strict_selection.selected}
         option_diagnostics["selected_structure_strictly_eligible"] = int(
@@ -365,22 +416,29 @@ class ConnectedOpportunityService:
                 now,
                 "broker_account_unavailable",
                 scan_run_id=scan_run_id,
+                mode=mode,
             )
         positions = await projections.list_positions()
-        risk = RiskEngine(RiskPolicy()).evaluate(
+        open_planned_loss, underlying_open_risk, portfolio_greeks_available = position_exposure(
+            positions, normalized, account.equity
+        )
+        risk = RiskEngine(self._policy.as_risk_policy()).evaluate(
             candidate,
             RiskContext(
                 paper_equity=account.equity,
-                open_planned_loss=0,
-                underlying_open_risk=0,
+                open_planned_loss=open_planned_loss,
+                underlying_open_risk=underlying_open_risk,
                 daily_loss=max(account.last_equity - account.equity, Decimal("0")),
                 drawdown_percent=(
                     max(account.last_equity - account.equity, Decimal("0"))
                     / max(account.last_equity, Decimal("1"))
                     * Decimal("100")
                 ),
-                concurrent_option_structures=len(positions),
+                concurrent_option_structures=sum(
+                    1 for position in positions if position.asset_class.lower() == "us_option"
+                ),
                 broker_execution_allowed=gate.allowed,
+                portfolio_greeks_available=portfolio_greeks_available,
             ),
         )
         intent = _maybe_create_order_intent(
@@ -427,6 +485,7 @@ class ConnectedOpportunityService:
         *,
         scan_run_id: UUID | None = None,
         option_diagnostics: dict[str, Any] | None = None,
+        mode: ScanMode = ScanMode.EXECUTION,
     ) -> ConnectedAnalysis:
         result = ConnectedAnalysis(
             opportunity_id=opportunity_id,
@@ -434,7 +493,8 @@ class ConnectedOpportunityService:
             symbol=signal.symbol,
             disposition="UNAVAILABLE",
             observed_at=now,
-            expires_at=now + timedelta(minutes=2),
+            expires_at=now
+            + (timedelta(hours=18) if mode is ScanMode.PRE_SCAN else timedelta(minutes=2)),
             signal=signal.model_dump(mode="json"),
             trade_idea=idea.model_dump(mode="json"),
             option_diagnostics=option_diagnostics,

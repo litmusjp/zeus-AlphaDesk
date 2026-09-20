@@ -57,6 +57,23 @@ class BrokerExecutionGate:
             return ExecutionGateDecision(
                 allowed=False, reason="Alpaca account is blocked or suspended."
             )
+        positions = await self._projections.list_positions()
+        orders = await self._projections.list_orders()
+        if any(
+            position.identity_validated_at is None
+            or position.broker_account_id != account.account_id
+            or position.environment != "PAPER"
+            for position in positions
+        ) or any(
+            order.identity_validated_at is None
+            or order.broker_account_id != account.account_id
+            or order.environment != "PAPER"
+            for order in orders
+        ):
+            return ExecutionGateDecision(
+                allowed=False,
+                reason="Broker projection identity is unavailable or mismatched.",
+            )
         return ExecutionGateDecision(allowed=True, reason="Broker state is known and reconciled.")
 
 

@@ -17,6 +17,7 @@ from packages.execution.conditional_approval import (
     revalidate_exit_for_submission,
     revalidate_for_submission,
 )
+from packages.execution.conditional_runner import _open_fill_response_is_valid
 from packages.execution.conditional_store import (
     _broker_evidence_is_valid,
     _finish_transition_allowed,
@@ -140,6 +141,12 @@ def test_execution_states_cannot_be_renewed(state: ApprovalState) -> None:
 
 def test_terminal_state_cannot_be_downgraded_by_stale_worker() -> None:
     assert not _finish_transition_allowed(ApprovalState.FILLED, ApprovalState.SUBMITTED)
+    assert _finish_transition_allowed(
+        ApprovalState.DISPATCH_AUTHORIZED, ApprovalState.SUBMISSION_UNCERTAIN
+    )
+    assert not _finish_transition_allowed(
+        ApprovalState.DISPATCH_AUTHORIZED, ApprovalState.CONDITION_FAILED
+    )
     assert not _finish_transition_allowed(
         ApprovalState.SUBMISSION_UNCERTAIN, ApprovalState.CONDITION_FAILED
     )
@@ -319,6 +326,26 @@ def test_store_evidence_rejects_nonfinite_limit_price() -> None:
     )
 
 
+def test_open_and_store_evidence_accept_distinct_parent_and_leg_broker_order_ids() -> None:
+    order = broker_order(
+        legs=(broker_order().legs[0].model_copy(update={"broker_order_id": "broker-other"}),),
+    )
+
+    assert _open_fill_response_is_valid(order)
+    assert _broker_evidence_is_valid(broker_record(), ApprovalState.SUBMITTED, order)
+
+
+@pytest.mark.parametrize("leg_broker_order_id", ["", None])
+def test_open_and_store_evidence_reject_missing_or_empty_leg_broker_order_id(
+    leg_broker_order_id: str | None,
+) -> None:
+    leg = broker_order().legs[0].model_copy(update={"broker_order_id": leg_broker_order_id})
+    order = broker_order(legs=(leg,))
+
+    assert not _open_fill_response_is_valid(order)
+    assert not _broker_evidence_is_valid(broker_record(), ApprovalState.SUBMITTED, order)
+
+
 def test_store_evidence_rejects_price_above_approval_bound() -> None:
     order = broker_order(limit_price=Decimal("4.51"))
     assert not _broker_evidence_is_valid(
@@ -361,3 +388,33 @@ def test_store_evidence_preserves_a_full_terminal_fill() -> None:
         ),
     )
     assert _broker_evidence_is_valid(broker_record(), ApprovalState.FILLED, order)
+
+
+@pytest.mark.parametrize(
+    ("target", "filled_quantity", "expected"),
+    [
+        (ApprovalState.SUBMITTED, Decimal("0"), True),
+        (ApprovalState.PARTIALLY_FILLED, Decimal("0.5"), True),
+        (ApprovalState.FILLED, Decimal("1"), True),
+        (ApprovalState.SUBMITTED, Decimal("1"), False),
+        (ApprovalState.PARTIALLY_FILLED, Decimal("0"), False),
+    ],
+)
+def test_store_evidence_applies_done_for_day_fill_matrix(
+    target: ApprovalState, filled_quantity: Decimal, expected: bool
+) -> None:
+    order = broker_order(
+        status="done_for_day",
+        filled_quantity=filled_quantity,
+        filled_average_price=Decimal("4.50") if filled_quantity else None,
+        legs=tuple(
+            leg.model_copy(
+                update={
+                    "filled_quantity": filled_quantity,
+                    "status": "filled" if filled_quantity == Decimal("1") else "done_for_day",
+                }
+            )
+            for leg in broker_order().legs
+        ),
+    )
+    assert _broker_evidence_is_valid(broker_record(), target, order) is expected

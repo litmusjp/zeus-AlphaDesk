@@ -55,7 +55,7 @@ export function InvitationAdmin() {
       <div className="invite-admin-grid">
         <form className="invite-form" onSubmit={create}>
           <div className="invite-form-heading"><TicketCheck /><div><h2>Create invitation</h2><p>Set access limits, then share the code privately.</p></div></div>
-          <label>Internal comment<input value={comment} maxLength={240} onChange={(event) => setComment(event.target.value)} placeholder="Hackathon judge access" /></label>
+          <label>Internal comment<input value={comment} maxLength={240} onChange={(event) => setComment(event.target.value)} placeholder="Partner access" /></label>
           <div className="invite-form-row">
             <label>Usage cap<input type="number" min={1} max={100} value={uses} onChange={(event) => setUses(Number(event.target.value))} /></label>
             <label>Expires in days<input type="number" min={1} max={90} value={days} onChange={(event) => setDays(Number(event.target.value))} /></label>

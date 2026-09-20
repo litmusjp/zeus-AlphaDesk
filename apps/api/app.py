@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.routes.admin import router as admin_router
+from apps.api.routes.agent import router as agent_router
 from apps.api.routes.auth import router as auth_router
 from apps.api.routes.desk import router as desk_router
 from apps.api.routes.health import router as health_router
@@ -104,7 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "https://web-production-1aedb.up.railway.app",
         ],
         allow_methods=["DELETE", "GET", "POST", "PUT"],
-        allow_headers=["Accept", "Authorization", "Content-Type"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-AlphaDesk-API-Key"],
         allow_credentials=True,
     )
     application.state.settings = resolved_settings
@@ -120,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(identity_router, prefix="/api/v1")
     application.include_router(admin_router, prefix="/api/v1")
     application.include_router(desk_router, prefix="/api/v1")
+    application.include_router(agent_router, prefix="/api/v1")
     return application
 
 

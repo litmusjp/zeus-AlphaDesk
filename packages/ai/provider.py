@@ -260,6 +260,7 @@ class AnthropicProvider:
         response_model: type[ResponseT],
     ) -> ResponseT:
         tool_name = "".join(character for character in agent_name if character.isalnum())[:48]
+        last_schema_error: StructuredOutputError | None = None
         for attempt, max_tokens in enumerate((5000, 8000)):
             retry_instructions = (
                 instructions
@@ -267,7 +268,8 @@ class AnthropicProvider:
                 else instructions
                 + "\nBe concise: summary <= 240 characters, at most 3 limitations, "
                 + "at most 5 recommendations, at most 3 risks per recommendation, "
-                + "and return every required field exactly once."
+                + "return every required field exactly once, include at least one "
+                + "recommendation, and omit as_of if present because the server supplies it."
             )
             response = await asyncio.wait_for(
                 self._client.messages.create(
@@ -294,13 +296,16 @@ class AnthropicProvider:
                             getattr(block, "input", None),
                             stop_reason=getattr(response, "stop_reason", None),
                         )
-                    except StructuredOutputError:
+                    except StructuredOutputError as error:
+                        last_schema_error = error
                         if attempt == 0:
                             break
                         raise
             else:
                 if attempt == 0 and getattr(response, "stop_reason", None) == "max_tokens":
                     continue
+                if last_schema_error is not None:
+                    raise last_schema_error
                 raise ValueError(f"{agent_name} returned no structured output")
         raise StructuredOutputError(
             "Provider returned schema-invalid structured output",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from packages.ai.provider import FixtureAIProvider
 from packages.ai.watchlist import (
@@ -113,6 +114,59 @@ async def test_watchlist_research_returns_schema_valid_ranked_advice() -> None:
     assert result.recommendations[0].action == "KEEP"
     assert result.recommendations[0].citations[0].source_id == "scan-AAPL"
     assert result.as_of.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_watchlist_research_accepts_provider_report_without_as_of() -> None:
+    provider = FixtureAIProvider(
+        {
+            "watchlist_research": {
+                "summary": "Keep the symbol under review.",
+                "limitations": ["The evidence is a point-in-time scan."],
+                "recommendations": [
+                    {
+                        "symbol": "AAPL",
+                        "action": "WATCH",
+                        "rank": 1,
+                        "rationale": "The available scan evidence is mixed.",
+                        "option_assessment": "INSUFFICIENT_DATA",
+                        "option_reason": "The scan did not establish option suitability.",
+                        "risks": ["Evidence may become stale."],
+                        "confidence": 0.5,
+                        "citations": [{"source_id": "scan-AAPL", "claim": "Scan evidence."}],
+                    }
+                ],
+            }
+        }
+    )
+
+    result = await run_watchlist_research(
+        provider,
+        symbols=("AAPL",),
+        evidence=({"source_id": "scan-AAPL", "symbol": "AAPL", "status": "AVAILABLE"},),
+    )
+
+    assert result.as_of is None
+
+
+@pytest.mark.asyncio
+async def test_watchlist_research_rejects_empty_recommendations() -> None:
+    provider = FixtureAIProvider(
+        {
+            "watchlist_research": {
+                "summary": "No recommendations.",
+                "limitations": ["The evidence is incomplete."],
+                "recommendations": [],
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        await run_watchlist_research(
+            provider,
+            symbols=("AAPL",),
+            evidence=({"source_id": "scan-AAPL", "symbol": "AAPL", "status": "AVAILABLE"},),
+        )
 
 
 @pytest.mark.asyncio

@@ -72,7 +72,8 @@ class WatchlistResearchReport(BaseModel):
     summary: str = Field(min_length=1, max_length=1200)
     limitations: tuple[str, ...] = Field(min_length=1, max_length=8)
     recommendations: tuple[WatchlistRecommendation, ...] = Field(min_length=1, max_length=10)
-    as_of: datetime
+    # The provider may omit this: the API owns the scan completion timestamp.
+    as_of: datetime | None = None
 
 
 WATCHLIST_RESEARCH_PROMPT = """You are AlphaDesk's read-only watchlist research analyst.
@@ -95,6 +96,7 @@ This classification is commentary, not authorization. Cite only the exact source
 values supplied in the input.
 State limitations whenever evidence is stale, unavailable, incomplete, or based on
 scanner signals rather than fundamental research. Return only the required schema.
+The server supplies the final as_of timestamp, so you may omit as_of from the response.
 """
 
 
@@ -224,6 +226,8 @@ async def run_watchlist_research(
             and risk_approved
         ):
             raise ValueError(f"watchlist research overstated option eligibility for {item.symbol}")
-    if result.as_of.tzinfo is None or result.as_of > datetime.now(UTC) + timedelta(minutes=5):
+    if result.as_of is not None and (
+        result.as_of.tzinfo is None or result.as_of > datetime.now(UTC) + timedelta(minutes=5)
+    ):
         raise ValueError("watchlist research returned an unsupported freshness timestamp")
     return result

@@ -34,6 +34,7 @@ from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
+from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
 from packages.connected.opportunities import (
     ConnectedAnalysis,
@@ -89,6 +90,16 @@ class WorkspaceView(BaseModel):
     status: str
     scanner_enabled: bool
     watchlist_count: int
+
+
+class AssessmentPolicyInput(AssessmentPolicy):
+    model_config = ConfigDict(frozen=True)
+
+
+class AssessmentPolicyView(AssessmentPolicy):
+    model_config = ConfigDict(frozen=True)
+
+    updated_at: datetime | None = None
 
 
 class CredentialStatusView(BaseModel):
@@ -340,6 +351,102 @@ async def workspace_view(
         scanner_enabled=workspace.scanner_enabled,
         watchlist_count=watchlist_count,
     )
+
+
+@router.get("/assessment-policy", response_model=AssessmentPolicyView)
+async def get_assessment_policy(
+    request: Request, context: WorkspaceContext = Depends(require_workspace)
+) -> AssessmentPolicyView:
+    async with request.app.state.database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, context.workspace_id)
+        assert workspace is not None
+        policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
+        updated_at = workspace.updated_at
+    return AssessmentPolicyView(**policy.model_dump(), updated_at=updated_at)
+
+
+@router.put("/assessment-policy", response_model=AssessmentPolicyView)
+async def update_assessment_policy(
+    payload: AssessmentPolicyInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> AssessmentPolicyView:
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        workspace = await session.get(WorkspaceRecord, context.workspace_id, with_for_update=True)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        pending_approvals = list(
+            await session.scalars(
+                select(ConditionalApprovalRecord).where(
+                    ConditionalApprovalRecord.workspace_id == context.workspace_id,
+                    ConditionalApprovalRecord.approval_kind == "OPEN",
+                    ConditionalApprovalRecord.state.in_(
+                        (
+                            ApprovalState.REVALIDATING,
+                            ApprovalState.READY_TO_SUBMIT,
+                            ApprovalState.SUBMITTING,
+                            ApprovalState.DISPATCH_AUTHORIZED,
+                            ApprovalState.SUBMISSION_UNCERTAIN,
+                        )
+                    ),
+                )
+            )
+        )
+        if pending_approvals:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Wait for active paper submissions to finish before changing "
+                    "assessment settings"
+                ),
+            )
+        workspace.assessment_policy = payload.model_dump(mode="json")
+        workspace.updated_at = now
+        active_approvals = list(
+            await session.scalars(
+                select(ConditionalApprovalRecord).where(
+                    ConditionalApprovalRecord.workspace_id == context.workspace_id,
+                    ConditionalApprovalRecord.approval_kind == "OPEN",
+                    ConditionalApprovalRecord.state.in_(
+                        (
+                            ApprovalState.APPROVED_FOR_SESSION,
+                            ApprovalState.REVALIDATING,
+                            ApprovalState.READY_TO_SUBMIT,
+                            ApprovalState.SUBMITTING,
+                            ApprovalState.DISPATCH_AUTHORIZED,
+                            ApprovalState.SUBMISSION_UNCERTAIN,
+                        )
+                    ),
+                )
+            )
+        )
+        for approval in active_approvals:
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=context.workspace_id,
+                    actor_user_id=context.principal.user_id,
+                    action="CONDITIONAL_APPROVAL_INVALIDATED_POLICY_UPDATE",
+                    detail={"approval_id": str(approval.approval_id)},
+                    occurred_at=now,
+                )
+            )
+        for approval in active_approvals:
+            approval.state = ApprovalState.CONDITION_FAILED
+            approval.failure_reason = "assessment_policy_updated"
+            approval.updated_at = now
+        session.add(
+            AuditRecord(
+                audit_id=uuid4(),
+                workspace_id=context.workspace_id,
+                actor_user_id=context.principal.user_id,
+                action="ASSESSMENT_POLICY_UPDATED",
+                detail={"policy": payload.model_dump(mode="json")},
+                occurred_at=now,
+            )
+        )
+    return AssessmentPolicyView(**payload.model_dump(), updated_at=now)
 
 
 @router.get("/credentials", response_model=list[CredentialStatusView])
@@ -757,11 +864,17 @@ async def _opportunity_service(
     secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
     if secrets is None:
         raise HTTPException(status_code=409, detail="Verified Alpaca paper credentials required")
+    async with request.app.state.database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, context.workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
     return ConnectedOpportunityService(
         request.app.state.database.sessions,
         context.workspace_id,
         str(secrets["api_key_id"]),
         str(secrets["secret_key"]),
+        policy=policy,
     )
 
 
@@ -1402,6 +1515,18 @@ async def list_conditional_approvals(
     return [_conditional_approval_view(record, symbol) for record, symbol in rows]
 
 
+def _validate_open_approval_renewal(
+    existing: ConditionalApprovalRecord,
+    intent: OrderIntent,
+) -> None:
+    structure_fingerprint = order_structure_fingerprint(intent)
+    if existing.structure_fingerprint != structure_fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved open structure changed; require a new approval",
+        )
+
+
 @router.post(
     "/opportunities/{opportunity_id}/approve-session",
     response_model=ConditionalApprovalView,
@@ -1507,6 +1632,7 @@ async def approve_for_next_session(
                     status_code=409,
                     detail="Opportunity already has a submitted or unresolved approval",
                 )
+            _validate_open_approval_renewal(existing, intent)
             record = existing
             record.approved_by_user_id = context.principal.user_id
             record.state = ApprovalState.APPROVED_FOR_SESSION
@@ -1514,7 +1640,6 @@ async def approve_for_next_session(
             record.session_date = session_date
             record.approved_at = now
             record.expires_at = expires_at
-            record.client_order_id = intent.client_order_id
             record.structure_fingerprint = order_structure_fingerprint(intent)
             record.approved_intent_payload = intent.model_dump(mode="json")
             record.approved_structure_identity = candidate_structure_identity(candidate)
@@ -1644,6 +1769,7 @@ async def approve_position_close_for_next_session(
         raise HTTPException(
             status_code=409, detail="This exact position already has an open broker close order"
         )
+    structure_fingerprint = f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
     now = datetime.now(UTC)
     async with request.app.state.database.sessions.begin() as session:
         existing = await session.scalar(
@@ -1675,16 +1801,18 @@ async def approve_position_close_for_next_session(
                         "This exact position already has a submitted or unresolved close approval"
                     ),
                 )
+            if existing.structure_fingerprint != structure_fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail=("The approved close structure changed; require a new close approval"),
+                )
             record = existing
             record.approved_by_user_id = context.principal.user_id
             record.approved_broker_account_id = snapshot.account.account_id
             record.state = ApprovalState.APPROVED_FOR_SESSION
             record.approved_at = now
             record.expires_at = expires_at
-            record.client_order_id = f"ad-exit-{uuid4().hex}"
-            record.structure_fingerprint = (
-                f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
-            )
+            record.structure_fingerprint = structure_fingerprint
             record.max_limit_price = bound if order_side is ExitOrderSide.BUY else Decimal("0")
             record.min_limit_price = bound if order_side is ExitOrderSide.SELL else None
             record.max_quantity = int(quantity)
@@ -1712,9 +1840,7 @@ async def approve_position_close_for_next_session(
                 approved_at=now,
                 expires_at=expires_at,
                 client_order_id=f"ad-exit-{uuid4().hex}",
-                structure_fingerprint=(
-                    f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
-                ),
+                structure_fingerprint=structure_fingerprint,
                 max_limit_price=bound if order_side is ExitOrderSide.BUY else Decimal("0"),
                 min_limit_price=bound if order_side is ExitOrderSide.SELL else None,
                 max_loss=Decimal("0"),
@@ -1896,6 +2022,11 @@ async def confirm_paper_order(
         )
     if record is None:
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    async with request.app.state.database.sessions() as policy_session:
+        workspace = await policy_session.get(WorkspaceRecord, context.workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
     opportunity = ConnectedAnalysis.model_validate(record.payload)
     if opportunity.source != "ALPACA_REAL" or opportunity.order_intent is None:
         raise HTTPException(
@@ -1924,6 +2055,7 @@ async def confirm_paper_order(
             workspace_id=context.workspace_id,
             candidate=candidate,
             intent=intent,
+            policy=policy,
         )
     except (RuntimeError, SubmissionUncertain) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error

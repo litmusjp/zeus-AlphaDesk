@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -52,6 +52,15 @@ class PostgresIntentStore:
         async with self._sessions.begin() as session:
             if await session.scalar(statement) is None:
                 raise KeyError(client_order_id)
+
+    async def release_submission(self, client_order_id: str) -> None:
+        statement = delete(OrderIntentRecord).where(
+            OrderIntentRecord.workspace_id == self._workspace_id,
+            OrderIntentRecord.client_order_id == client_order_id,
+            OrderIntentRecord.state == ExecutionState.SUBMISSION_STARTED.value,
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(statement)
 
     async def get_state(self, client_order_id: str) -> ExecutionState | None:
         async with self._sessions() as session:

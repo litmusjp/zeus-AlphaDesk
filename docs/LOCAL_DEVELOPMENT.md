@@ -113,7 +113,7 @@ docker compose --env-file .env.local logs --tail=200 web
 docker compose --env-file .env.local exec api alembic current
 ```
 
-The expected migration head is `20260903_0009`.
+The expected migration head is `20260920_0018`.
 
 Stop without deleting persisted data:
 

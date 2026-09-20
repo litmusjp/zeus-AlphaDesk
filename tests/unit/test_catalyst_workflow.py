@@ -5,7 +5,8 @@ from decimal import Decimal
 
 import pytest
 
-from packages.domain.broker import BrokerOrder, BrokerOrderLeg, OrderSubmission
+from packages.broker.adapter import BrokerPreflightFailed
+from packages.domain.broker import BrokerOrder, BrokerOrderLeg, OrderSubmission, SubmissionLeg
 from packages.domain.options import (
     Greeks,
     LegSide,
@@ -23,11 +24,15 @@ from packages.domain.workflow import (
     RiskDecision,
     Signal,
 )
+from packages.execution.conditional_approval import ApprovalState
+from packages.execution.conditional_exit_runner import _broker_order_state
 from packages.execution.engine import (
     DuplicateSubmission,
+    ExecutionBlocked,
     ExecutionEngine,
     ExecutionState,
     InMemoryIntentStore,
+    _broker_order_matches_intent,
 )
 from packages.execution.intents import create_order_intent
 from packages.options.engine import build_structure
@@ -150,6 +155,112 @@ def test_risk_veto_cannot_create_order_intent() -> None:
     )
     with pytest.raises(ValueError, match="Rejected risk decision"):
         create_order_intent(rejected, candidate)
+
+
+def test_done_for_day_partial_fill_preserves_open_exposure() -> None:
+    assert (
+        _broker_order_state("done_for_day", Decimal("1"), Decimal("2"))
+        is ApprovalState.PARTIALLY_FILLED
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_execution_accepts_done_for_day_partial_fill() -> None:
+    _, _, intent = approved_workflow()
+    order = await FakeAdapter().submit_order(
+        OrderSubmission(
+            client_order_id=intent.client_order_id,
+            quantity=intent.quantity,
+            limit_price=intent.limit_price,
+            legs=tuple(
+                SubmissionLeg(symbol=leg.symbol, side=leg.side, ratio=leg.ratio)
+                for leg in intent.legs
+            ),
+        )
+    )
+    partial = order.model_copy(
+        update={
+            "status": "done_for_day",
+            "filled_quantity": Decimal("1"),
+            "filled_average_price": Decimal("1.50"),
+        }
+    )
+    assert _broker_order_matches_intent(partial, intent, expected_broker_account_id=None)
+    assert _broker_order_state("done_for_day", Decimal("2"), Decimal("2")) is ApprovalState.FILLED
+    assert (
+        _broker_order_state("done_for_day", Decimal("0"), Decimal("2")) is ApprovalState.SUBMITTED
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filled_quantity", "expected_state"),
+    [
+        (Decimal("0"), ExecutionState.SUBMITTED),
+        (Decimal("0.5"), ExecutionState.PARTIALLY_FILLED),
+        (Decimal("1"), ExecutionState.FILLED),
+    ],
+)
+async def test_engine_maps_done_for_day_by_fill_outcome(
+    filled_quantity: Decimal, expected_state: ExecutionState
+) -> None:
+    _, _, intent = approved_workflow()
+    base = await FakeAdapter().submit_order(
+        OrderSubmission(
+            client_order_id=intent.client_order_id,
+            quantity=intent.quantity,
+            limit_price=intent.limit_price,
+            legs=tuple(
+                SubmissionLeg(symbol=leg.symbol, side=leg.side, ratio=leg.ratio)
+                for leg in intent.legs
+            ),
+        )
+    )
+    order = base.model_copy(
+        update={
+            "status": "done_for_day",
+            "filled_quantity": filled_quantity,
+            "filled_average_price": Decimal("1.50") if filled_quantity else None,
+        }
+    )
+
+    class DoneForDayAdapter(FakeAdapter):
+        async def submit_order(self, submission: OrderSubmission) -> BrokerOrder:
+            return order
+
+    store = InMemoryIntentStore()
+    await ExecutionEngine(DoneForDayAdapter(), store).execute(intent)  # type: ignore[arg-type]
+    assert await store.get_state(intent.client_order_id) is expected_state
+
+
+class PreflightAdapter:
+    async def submit_order(self, order: OrderSubmission) -> BrokerOrder:
+        raise BrokerPreflightFailed("market closed")
+
+
+class DeniedSubmissionFence:
+    async def submission_allowed(self) -> tuple[bool, str]:
+        return False, "approval ownership changed"
+
+
+@pytest.mark.asyncio
+async def test_submission_fence_blocks_broker_mutation() -> None:
+    _, _, intent = approved_workflow()
+    store = InMemoryIntentStore()
+    engine = ExecutionEngine(FakeAdapter(), store, submission_fence=DeniedSubmissionFence())  # type: ignore[arg-type]
+    with pytest.raises(ExecutionBlocked, match="approval ownership changed"):
+        await engine.execute(intent)
+    assert await store.get_state(intent.client_order_id) is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_failure_does_not_reserve_intent() -> None:
+    _, _, intent = approved_workflow()
+    store = InMemoryIntentStore()
+    engine = ExecutionEngine(PreflightAdapter(), store)  # type: ignore[arg-type]
+    with pytest.raises(ExecutionBlocked, match="market closed"):
+        await engine.execute(intent)
+    assert await store.get_state(intent.client_order_id) is None
 
 
 class FakeAdapter:

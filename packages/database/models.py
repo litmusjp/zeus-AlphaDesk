@@ -50,8 +50,26 @@ class WorkspaceRecord(Base):
     workspace_type: Mapped[str] = mapped_column(String(32), default="CONNECTED_PAPER")
     status: Mapped[str] = mapped_column(String(32), default="ONBOARDING", index=True)
     scanner_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    assessment_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class AgentAPIKeyRecord(Base):
+    __tablename__ = "agent_api_keys"
+
+    key_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    key_prefix: Mapped[str] = mapped_column(String(24))
+    name: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class InvitationRecord(Base):
@@ -187,6 +205,9 @@ class ConditionalApprovalRecord(Base):
             "session_date",
             name="uq_conditional_exit_position_session",
         ),
+        UniqueConstraint(
+            "workspace_id", "client_order_id", name="uq_conditional_approval_workspace_client"
+        ),
     )
 
     approval_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
@@ -209,7 +230,7 @@ class ConditionalApprovalRecord(Base):
     session_date: Mapped[date] = mapped_column(Date, index=True)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    client_order_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    client_order_id: Mapped[str] = mapped_column(String(64), index=True)
     structure_fingerprint: Mapped[str] = mapped_column(String(512))
     approved_intent_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     approved_structure_identity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -226,6 +247,13 @@ class ConditionalApprovalRecord(Base):
     broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), index=True)
+    submission_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    submission_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), index=True)
+    dispatch_authorized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -316,6 +344,7 @@ class BrokerAccountRecord(Base):
         primary_key=True,
     )
     account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(16), default="PAPER")
     account_number: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32))
     currency: Mapped[str] = mapped_column(String(8))
@@ -339,6 +368,11 @@ class BrokerPositionRecord(Base):
         primary_key=True,
     )
     asset_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    broker_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    environment: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    identity_validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     symbol: Mapped[str] = mapped_column(String(48), index=True)
     asset_class: Mapped[str] = mapped_column(String(32), index=True)
     side: Mapped[str] = mapped_column(String(16))
@@ -366,6 +400,11 @@ class BrokerOrderRecord(Base):
         primary_key=True,
     )
     broker_order_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    broker_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    environment: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    identity_validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     client_order_id: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     asset_class: Mapped[str] = mapped_column(String(32))

@@ -13,6 +13,10 @@ from packages.domain.broker import (
 )
 
 
+class BrokerPreflightFailed(RuntimeError):
+    """The adapter refused a mutation before calling the provider."""
+
+
 class BrokerAdapter(Protocol):
     async def get_account(self) -> BrokerAccount: ...
 

@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from packages.ai.provider import AnthropicProvider, OpenRouterProvider, StructuredOutputError
+from packages.ai.watchlist import WatchlistResearchReport
 
 
 class Probe(BaseModel):
@@ -207,3 +208,62 @@ async def test_anthropic_provider_retries_truncated_tool_output_concisely() -> N
     assert len(client.messages.calls) == 2
     assert client.messages.calls[1]["max_tokens"] > client.messages.calls[0]["max_tokens"]
     assert "Be concise" in str(client.messages.calls[1]["system"])
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_retries_invalid_watchlist_payload_with_required_fields() -> None:
+    client = RetryClient(
+        [
+            SimpleNamespace(
+                stop_reason="tool_use",
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        input={"summary": "missing recommendations and as_of"},
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                stop_reason="tool_use",
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        input={
+                            "summary": "Keep AAPL under review.",
+                            "limitations": ["Point-in-time scan."],
+                            "recommendations": [
+                                {
+                                    "symbol": "AAPL",
+                                    "action": "WATCH",
+                                    "rank": 1,
+                                    "rationale": "The evidence is mixed.",
+                                    "option_assessment": "INSUFFICIENT_DATA",
+                                    "option_reason": "The scan is incomplete.",
+                                    "risks": ["Evidence may become stale."],
+                                    "confidence": 0.5,
+                                    "citations": [
+                                        {"source_id": "scan-AAPL", "claim": "Scan evidence."}
+                                    ],
+                                }
+                            ],
+                        },
+                    )
+                ],
+            ),
+        ]
+    )
+    provider = AnthropicProvider("test-key", model="claude-test", client=client)
+
+    result = await provider.generate(
+        agent_name="watchlist_research",
+        instructions="Return the watchlist report.",
+        input_payload="{}",
+        response_model=WatchlistResearchReport,
+    )
+
+    assert result.recommendations[0].symbol == "AAPL"
+    assert len(client.messages.calls) == 2
+    retry_system = str(client.messages.calls[1]["system"])
+    assert "every required field" in retry_system
+    assert "at least one recommendation" in retry_system
+    assert "omit as_of" in retry_system

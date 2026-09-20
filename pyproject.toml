@@ -24,6 +24,11 @@ dependencies = [
   "uvicorn[standard]>=0.34,<1",
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "fastmcp>=2,<3",
+]
+
 [dependency-groups]
 dev = [
   "httpx2>=2,<3",

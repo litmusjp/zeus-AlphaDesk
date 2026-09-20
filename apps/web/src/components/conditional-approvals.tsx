@@ -83,7 +83,7 @@ export function ConditionalApprovals() {
   }
 
   const active = approvals.filter((item) =>
-    ["APPROVED_FOR_SESSION", "REVALIDATING", "READY_TO_SUBMIT"].includes(item.state),
+    ["APPROVED_FOR_SESSION", "REVALIDATING", "READY_TO_SUBMIT", "SUBMITTING"].includes(item.state),
   ).length;
   const submitted = approvals.filter((item) =>
     ["SUBMITTED", "PARTIALLY_FILLED", "FILLED"].includes(item.state),

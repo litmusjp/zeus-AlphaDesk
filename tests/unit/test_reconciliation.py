@@ -39,6 +39,8 @@ def account(*, blocked: bool = False) -> BrokerAccount:
 def position(asset_id: str) -> BrokerPosition:
     return BrokerPosition(
         asset_id=asset_id,
+        broker_account_id="account-1",
+        environment="PAPER",
         symbol="NVDA260918C00120000",
         asset_class="us_option",
         side="long",
@@ -53,6 +55,8 @@ def position(asset_id: str) -> BrokerPosition:
 def order(order_id: str) -> BrokerOrder:
     return BrokerOrder(
         broker_order_id=order_id,
+        broker_account_id="account-1",
+        environment="PAPER",
         client_order_id=f"client-{order_id}",
         status="accepted",
         asset_class="us_option",
@@ -63,6 +67,7 @@ def order(order_id: str) -> BrokerOrder:
         time_in_force="day",
         quantity=Decimal("1"),
         filled_quantity=Decimal("0"),
+        limit_price=Decimal("1.00"),
         created_at=NOW,
     )
 
