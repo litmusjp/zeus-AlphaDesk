@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { deskFetch } from "@/lib/api";
 import { StateCard } from "@/components/workspace-shell";
+import { recommendPositionAction } from "./position-recommendation";
 
 type Account = {
   equity: string;
@@ -204,7 +205,7 @@ export function DeskPositions() {
       </p>
 
       <section className="data-table">
-        <header style={{ gridTemplateColumns: "1.4fr 1.2fr .8fr 1fr 1fr .8fr 1.1fr" }}>
+        <header style={{ gridTemplateColumns: "1.4fr 1.2fr .8fr 1fr 1fr .8fr 1.1fr 1fr" }}>
           <span>CONTRACT / STRUCTURE</span>
           <span>EXPIRY & SIDE</span>
           <span>QTY</span>
@@ -212,6 +213,7 @@ export function DeskPositions() {
           <span>UNREALIZED P/L</span>
           <span>STATE</span>
           <span>ACTION</span>
+          <span>RECOMMENDATION</span>
         </header>
         {state.positions.length ? (
           state.positions.map((p) => {
@@ -220,12 +222,13 @@ export function DeskPositions() {
             const isPositive = unrealized >= 0;
             const isSelected = closeAction?.symbol === p.symbol;
             const selectedMode = isSelected ? closeAction.mode : null;
+            const recommendation = recommendPositionAction(p);
 
             return (
               <div
                 className="data-row"
                 key={p.asset_id}
-                style={{ gridTemplateColumns: "1.4fr 1.2fr .8fr 1fr 1fr .8fr 1.1fr" }}
+                style={{ gridTemplateColumns: "1.4fr 1.2fr .8fr 1fr 1fr .8fr 1.1fr 1fr" }}
               >
                 <div>
                   {isOption ? (
@@ -325,6 +328,14 @@ export function DeskPositions() {
                       Close position
                     </button>
                   )}
+                </div>
+                <div
+                  className="position-recommendation"
+                  title={recommendation.rationale}
+                  aria-label={`${recommendation.label}: ${recommendation.rationale}`}
+                >
+                  <span className="recommendation-badge recommendation-hold">{recommendation.label}</span>
+                  <small>{recommendation.rationale}</small>
                 </div>
               </div>
             );

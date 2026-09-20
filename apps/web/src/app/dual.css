@@ -48,6 +48,10 @@
 .closed-market-banner a{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:700;color:#2f591c;background:#edf5e6;padding:5px 9px;border-radius:4px;text-decoration:none}
 .closed-market-banner a:hover{background:#e0edd4}
 .disposition-badge-unavailable{font-size:8px;padding:3px 6px;border-radius:4px;background:#f5eade;color:#915714;font-weight:800;letter-spacing:.06em}
+.position-recommendation{display:flex;flex-direction:column;gap:4px;min-width:0}
+.recommendation-badge{width:max-content;padding:4px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.08em}
+.recommendation-hold{background:#edf2f7;color:#3d5268;border:1px solid #cbd7e3}
+.position-recommendation small{color:#5a6864;font-size:8px;line-height:1.35}
 .countdown-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:4px;background:#edf2f7;color:#3d5268;font-size:9px;font-weight:700;font-variant-numeric:tabular-nums}
 
 .watchlist-research-panel{margin-bottom:16px;padding:20px;border:1px solid #c8d9ed;border-top:3px solid var(--desk);border-radius:8px;background:linear-gradient(145deg,#fbfdff,#f5f9fe)}
