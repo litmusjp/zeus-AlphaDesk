@@ -1720,7 +1720,9 @@ async def approve_for_next_session(
             raise HTTPException(status_code=409, detail="Opportunity risk decision is not approved")
         if opportunity.order_intent is None:
             try:
-                intent = create_order_intent(risk_decision, candidate)
+                intent = create_order_intent(
+                    risk_decision, candidate, quantity=candidate.structure.quantity
+                )
             except ValueError as error:
                 raise HTTPException(
                     status_code=409, detail="Opportunity cannot be approved"

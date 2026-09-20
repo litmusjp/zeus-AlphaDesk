@@ -78,6 +78,23 @@ def test_non_intent_scan_never_creates_order_intent(monkeypatch: pytest.MonkeyPa
     assert result is None
 
 
+def test_execution_intent_uses_risk_evaluated_candidate_quantity() -> None:
+    candidate, risk, _ = approved_workflow()
+    candidate = candidate.model_copy(
+        update={"structure": candidate.structure.model_copy(update={"quantity": 10})}
+    )
+
+    intent = _maybe_create_order_intent(
+        risk,
+        candidate,
+        mode=ScanMode.EXECUTION,
+        create_intent=True,
+    )
+
+    assert intent is not None
+    assert intent.quantity == 10
+
+
 def test_pre_scan_approved_candidate_is_reviewable_without_intent() -> None:
     assert (
         _scan_disposition(

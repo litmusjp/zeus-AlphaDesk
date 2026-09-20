@@ -99,7 +99,7 @@ def _maybe_create_order_intent(
         return None
     if approved_intent is not None:
         return approved_intent
-    intent = create_order_intent(risk, candidate)
+    intent = create_order_intent(risk, candidate, quantity=candidate.structure.quantity)
     return intent
 
 
