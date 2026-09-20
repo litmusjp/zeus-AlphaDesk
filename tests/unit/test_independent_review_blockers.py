@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 import apps.api.routes.desk as desk_routes
+import packages.execution.conditional_exit_runner as exit_runner
 from packages.auth.dependencies import AuthPrincipal, WorkspaceContext
 from packages.broker.projections import MemoryBrokerProjectionStore
 from packages.database.models import ConditionalApprovalRecord
@@ -22,12 +23,40 @@ from packages.domain.broker import (
     OrderSubmission,
     ReconciliationSnapshot,
 )
-from packages.domain.system import BrokerState
+from packages.domain.system import BrokerState, TradingEnvironment
 from packages.domain.workflow import IntentLeg, OrderIntent, stable_client_order_id
-from packages.execution.conditional_approval import order_structure_fingerprint
+from packages.execution.conditional_approval import ExitOrderSide, order_structure_fingerprint
 from packages.execution.engine import ExecutionBlocked, ExecutionEngine, InMemoryIntentStore
 
 NOW = datetime(2026, 9, 20, 14, tzinfo=UTC)
+
+
+def test_live_close_order_identity_is_bound_to_live_environment() -> None:
+    order = SimpleNamespace(
+        broker_order_id="broker-1",
+        broker_account_id="live-account",
+        environment="LIVE",
+        client_order_id="client-1",
+        symbol="AAPL250117C00100000",
+        side="sell",
+        asset_class="us_option",
+        quantity=Decimal("1"),
+        order_type="limit",
+        order_class="simple",
+        time_in_force="day",
+        limit_price=Decimal("1.25"),
+    )
+
+    assert exit_runner._close_order_matches(
+        order,
+        client_order_id="client-1",
+        symbol="AAPL250117C00100000",
+        order_side=ExitOrderSide.SELL,
+        quantity=1,
+        expected_limit_price=Decimal("1.25"),
+        expected_broker_account_id="live-account",
+        expected_environment=TradingEnvironment.LIVE,
+    )
 
 
 class _Begin:

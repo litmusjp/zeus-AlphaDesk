@@ -61,6 +61,7 @@ def _close_order_matches(
     expected_limit_price: Decimal | None = None,
     limit_price_bound: Decimal | None = None,
     expected_broker_account_id: str | None = None,
+    expected_environment: TradingEnvironment = TradingEnvironment.PAPER,
 ) -> bool:
     order_limit = getattr(order, "limit_price", None)
     if order_limit is None or not order_limit.is_finite() or order_limit <= 0:
@@ -71,7 +72,7 @@ def _close_order_matches(
             expected_broker_account_id is None
             or (
                 getattr(order, "broker_account_id", None) == expected_broker_account_id
-                and getattr(order, "environment", None) == "PAPER"
+                and getattr(order, "environment", None) == expected_environment.value
             )
         )
         and getattr(order, "client_order_id", None) == client_order_id
@@ -308,6 +309,7 @@ async def _process_claimed_exit(
                     quantity=record.max_quantity,
                     limit_price_bound=bound,
                     expected_broker_account_id=record.approved_broker_account_id,
+                    expected_environment=environment,
                 ):
                     await _finish(
                         record.approval_id,
@@ -491,7 +493,7 @@ async def _process_claimed_exit(
         terminal_order_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
         if (
             record.approved_broker_account_id is None
-            or final_snapshot.account.environment != "PAPER"
+            or final_snapshot.account.environment != environment.value
             or final_snapshot.account.account_id != record.approved_broker_account_id
             or final_position is None
             or final_position.asset_class.lower() != "us_option"
@@ -600,7 +602,9 @@ async def _process_claimed_exit(
             return
         try:
             market_clock = await AlpacaMarketClockAdapter(
-                str(secret["api_key_id"]), str(secret["secret_key"])
+                str(secret["api_key_id"]),
+                str(secret["secret_key"]),
+                environment=environment,
             ).get_clock()
         except Exception as error:
             raise PreSubmissionCheckFailed("authoritative_market_clock_unavailable") from error
@@ -633,6 +637,7 @@ async def _process_claimed_exit(
             quantity=record.max_quantity,
             expected_limit_price=final_limit_price,
             expected_broker_account_id=record.approved_broker_account_id,
+            expected_environment=environment,
         ):
             await _finish(
                 record.approval_id,
@@ -774,6 +779,7 @@ async def _recover_ready_to_submit(
                         else record.max_limit_price
                     ),
                     expected_broker_account_id=record.approved_broker_account_id,
+                    expected_environment=environment,
                 )
                 else ApprovalState.SUBMISSION_UNCERTAIN
             )
