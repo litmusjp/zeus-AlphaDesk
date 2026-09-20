@@ -1,10 +1,25 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { AssessmentPolicyPage } from "./assessment-policy";
+import { deskFetch } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
-  deskFetch: vi.fn(() => Promise.resolve({})),
+  deskFetch: vi.fn((path: string, init?: RequestInit) => {
+    if (init?.method === "PUT") return Promise.resolve({ ...policyResponse, active_profile: "FAIR" });
+    return Promise.resolve(policyResponse);
+  }),
 }));
+
+const policyResponse = {
+  active_profile: "CONSERVATIVE",
+  available_profiles: [
+    { value: "VERY_CONSERVATIVE", label: "Very Conservative" },
+    { value: "CONSERVATIVE", label: "Conservative" },
+    { value: "FAIR", label: "Fair" },
+    { value: "AGGRESSIVE", label: "Aggressive" },
+    { value: "VERY_AGGRESSIVE", label: "Very Aggressive" },
+  ],
+};
 
 describe("AssessmentPolicyPage", () => {
   it("shows original defaults in every editable range and preserves direction guidance", () => {
@@ -43,5 +58,16 @@ describe("AssessmentPolicyPage", () => {
     expect(screen.getByText("Fixed: required; there is no editable range.")).toBeInTheDocument();
     expect(screen.getByText(/Lower allows less interest; higher requires more interest\. Blank applies no minimum\./)).toBeInTheDocument();
     expect(screen.getByText(/Lower allows less vega exposure; higher allows more vega exposure\./)).toBeInTheDocument();
+  });
+
+  it("renders the accessible profile selector and saves a selected profile", async () => {
+    render(<AssessmentPolicyPage />);
+
+    const selector = await screen.findByRole("combobox", { name: "Candidate Assessment risk profile" });
+    expect(screen.getAllByText("Conservative").length).toBeGreaterThan(0);
+    fireEvent.change(selector, { target: { value: "FAIR" } });
+
+    expect(deskFetch).toHaveBeenCalledWith("/desk/assessment-policy", expect.objectContaining({ method: "PUT" }));
+    expect((await screen.findAllByText(/Fair profile saved/)).length).toBeGreaterThan(0);
   });
 });

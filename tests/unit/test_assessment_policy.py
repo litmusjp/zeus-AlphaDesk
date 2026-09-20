@@ -2,7 +2,12 @@ from decimal import Decimal
 
 import pytest
 
-from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.assessment_policy import (
+    AssessmentPolicy,
+    AssessmentProfile,
+    materialize_profile,
+    profile_for_policy,
+)
 from packages.connected.option_scan_policy import ScanMode, select_contracts
 from packages.domain.options import OptionType
 from tests.unit.test_option_scan_policy import AS_OF, contract
@@ -19,6 +24,27 @@ def test_policy_defaults_are_safe_and_translate_to_risk_policy() -> None:
     assert policy.max_investment_per_candidate == Decimal("250")
     assert risk.max_planned_loss_per_trade_pct_equity == Decimal("0.50")
     assert risk.max_concurrent_option_structures == 8
+
+
+def test_profiles_materialize_the_proposed_values_and_legacy_defaults_are_conservative() -> None:
+    very_conservative = materialize_profile(AssessmentProfile.VERY_CONSERVATIVE)
+
+    assert very_conservative.minimum_signal_score == Decimal("80")
+    assert very_conservative.pre_scan_max_spread_ratio == Decimal("0.30")
+    assert very_conservative.pre_scan_min_open_interest == 250
+    assert very_conservative.max_abs_portfolio_vega == Decimal("1000")
+    assert materialize_profile(AssessmentProfile.CONSERVATIVE) == AssessmentPolicy()
+    assert profile_for_policy(AssessmentPolicy.from_payload({})) is AssessmentProfile.CONSERVATIVE
+
+
+def test_profile_round_trip_preserves_selected_profile_and_policy_values() -> None:
+    selected = materialize_profile(AssessmentProfile.AGGRESSIVE)
+    payload = {"profile": AssessmentProfile.AGGRESSIVE.value, **selected.model_dump(mode="json")}
+
+    restored = AssessmentPolicy.from_payload(payload)
+
+    assert restored == selected
+    assert profile_for_policy(restored) is AssessmentProfile.AGGRESSIVE
 
 
 def test_policy_rejects_inverted_expiry_range() -> None:

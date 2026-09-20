@@ -34,7 +34,13 @@ from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.broker.alpaca_adapter import AlpacaBrokerAdapter, AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
-from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.assessment_policy import (
+    ASSESSMENT_PROFILE_LABELS,
+    AssessmentPolicy,
+    AssessmentProfile,
+    materialize_profile,
+    profile_for_policy,
+)
 from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
 from packages.connected.opportunities import (
     ConnectedAnalysis,
@@ -97,11 +103,37 @@ class WorkspaceView(BaseModel):
 class AssessmentPolicyInput(AssessmentPolicy):
     model_config = ConfigDict(frozen=True)
 
+    profile: AssessmentProfile | None = None
+
+
+class AssessmentProfileOption(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    value: AssessmentProfile
+    label: str
+
 
 class AssessmentPolicyView(AssessmentPolicy):
     model_config = ConfigDict(frozen=True)
 
     updated_at: datetime | None = None
+    active_profile: str
+    available_profiles: tuple[AssessmentProfileOption, ...]
+
+
+def _assessment_policy_view(
+    policy: AssessmentPolicy, updated_at: datetime | None
+) -> AssessmentPolicyView:
+    profile = profile_for_policy(policy)
+    return AssessmentPolicyView(
+        **policy.model_dump(),
+        updated_at=updated_at,
+        active_profile=profile.value if profile is not None else "CUSTOM",
+        available_profiles=tuple(
+            AssessmentProfileOption(value=item, label=ASSESSMENT_PROFILE_LABELS[item])
+            for item in AssessmentProfile
+        ),
+    )
 
 
 class CredentialStatusView(BaseModel):
@@ -283,9 +315,7 @@ def _credential_store(request: Request) -> CredentialStore:
     return CredentialStore(request.app.state.database.sessions, cipher)
 
 
-async def _workspace_environment(
-    request: Request, workspace_id: UUID
-) -> TradingEnvironment:
+async def _workspace_environment(request: Request, workspace_id: UUID) -> TradingEnvironment:
     sessions = request.app.state.database.sessions
     if not callable(sessions):
         # Unit-level request doubles from the paper-only close path predate the
@@ -394,7 +424,7 @@ async def get_assessment_policy(
         assert workspace is not None
         policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
         updated_at = workspace.updated_at
-    return AssessmentPolicyView(**policy.model_dump(), updated_at=updated_at)
+    return _assessment_policy_view(policy, updated_at)
 
 
 @router.put("/assessment-policy", response_model=AssessmentPolicyView)
@@ -433,7 +463,16 @@ async def update_assessment_policy(
                     "assessment settings"
                 ),
             )
-        workspace.assessment_policy = payload.model_dump(mode="json")
+        policy = (
+            materialize_profile(payload.profile)
+            if payload.profile is not None
+            else AssessmentPolicy.model_validate(payload.model_dump(exclude={"profile"}))
+        )
+        active_profile = profile_for_policy(policy)
+        workspace.assessment_policy = {
+            "profile": active_profile.value if active_profile is not None else "CUSTOM",
+            **policy.model_dump(mode="json"),
+        }
         workspace.updated_at = now
         active_approvals = list(
             await session.scalars(
@@ -474,11 +513,14 @@ async def update_assessment_policy(
                 workspace_id=context.workspace_id,
                 actor_user_id=context.principal.user_id,
                 action="ASSESSMENT_POLICY_UPDATED",
-                detail={"policy": payload.model_dump(mode="json")},
+                detail={
+                    "profile": active_profile.value if active_profile is not None else "CUSTOM",
+                    "policy": policy.model_dump(mode="json"),
+                },
                 occurred_at=now,
             )
         )
-    return AssessmentPolicyView(**payload.model_dump(), updated_at=now)
+    return _assessment_policy_view(policy, now)
 
 
 @router.get("/credentials", response_model=list[CredentialStatusView])
@@ -504,9 +546,7 @@ async def _test_alpaca(
     payload: AlpacaCredentialInput, environment: TradingEnvironment
 ) -> ProviderTestResult:
     provider = (
-        ALPACA_LIVE_PROVIDER
-        if environment is TradingEnvironment.LIVE
-        else ALPACA_PAPER_PROVIDER
+        ALPACA_LIVE_PROVIDER if environment is TradingEnvironment.LIVE else ALPACA_PAPER_PROVIDER
     )
     adapter = AlpacaBrokerAdapter(
         payload.api_key_id.get_secret_value(),
@@ -724,8 +764,10 @@ async def delete_credentials(
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> None:
-    normalized = ALPACA_LIVE_PROVIDER if provider == "alpaca-live" else (
-        ALPACA_PAPER_PROVIDER if provider == "alpaca" else provider.upper()
+    normalized = (
+        ALPACA_LIVE_PROVIDER
+        if provider == "alpaca-live"
+        else (ALPACA_PAPER_PROVIDER if provider == "alpaca" else provider.upper())
     )
     await _credential_store(request).delete(
         workspace_id=context.workspace_id,
@@ -1838,9 +1880,7 @@ async def approve_position_close_for_next_session(
     if secrets is None:
         raise HTTPException(status_code=409, detail="Alpaca credential unavailable")
     adapter = (
-        AlpacaPaperBrokerAdapter(
-            str(secrets["api_key_id"]), str(secrets["secret_key"])
-        )
+        AlpacaPaperBrokerAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
         if environment is TradingEnvironment.PAPER
         else AlpacaBrokerAdapter(
             str(secrets["api_key_id"]),

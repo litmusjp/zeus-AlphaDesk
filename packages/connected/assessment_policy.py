@@ -1,12 +1,186 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from packages.domain.broker import BrokerPosition
 from packages.risk.engine import RiskPolicy
+
+
+class AssessmentProfile(StrEnum):
+    VERY_CONSERVATIVE = "VERY_CONSERVATIVE"
+    CONSERVATIVE = "CONSERVATIVE"
+    FAIR = "FAIR"
+    AGGRESSIVE = "AGGRESSIVE"
+    VERY_AGGRESSIVE = "VERY_AGGRESSIVE"
+
+
+ASSESSMENT_PROFILE_LABELS: dict[AssessmentProfile, str] = {
+    AssessmentProfile.VERY_CONSERVATIVE: "Very Conservative",
+    AssessmentProfile.CONSERVATIVE: "Conservative",
+    AssessmentProfile.FAIR: "Fair",
+    AssessmentProfile.AGGRESSIVE: "Aggressive",
+    AssessmentProfile.VERY_AGGRESSIVE: "Very Aggressive",
+}
+
+
+# This is the only source of truth for named policy profiles. Values are kept
+# as JSON-compatible scalars so the same materializer serves API and workers.
+ASSESSMENT_PROFILE_VALUES: dict[AssessmentProfile, dict[str, object]] = {
+    AssessmentProfile.VERY_CONSERVATIVE: {
+        "minimum_signal_score": "80",
+        "pre_scan_minimum_signal_score": "60",
+        "maximum_gap_percent": "5",
+        "minimum_catalyst_confidence": "0.80",
+        "pre_scan_minimum_catalyst_confidence": "0.60",
+        "minimum_dte": 30,
+        "maximum_dte": 60,
+        "execution_max_spread_ratio": "0.10",
+        "pre_scan_max_spread_ratio": "0.30",
+        "execution_min_open_interest": 1000,
+        "pre_scan_min_open_interest": 250,
+        "execution_max_quote_age_seconds": 30,
+        "pre_scan_max_quote_age_seconds": 3600,
+        "minimum_quote_size": "5",
+        "maximum_strike_distance_ratio": "0.10",
+        "require_greeks": True,
+        "max_investment_per_candidate": "100",
+        "maximum_contracts_per_candidate": 1,
+        "max_planned_loss_per_trade_pct_equity": "0.25",
+        "max_total_open_planned_loss_pct_equity": "1.5",
+        "max_underlying_risk_concentration_pct": "5",
+        "daily_loss_halt_pct_equity": "1",
+        "portfolio_drawdown_halt_pct": "5",
+        "max_concurrent_option_structures": 3,
+        "max_abs_portfolio_delta": "1000",
+        "max_abs_portfolio_gamma": "100",
+        "max_abs_portfolio_theta": "100",
+        "max_abs_portfolio_vega": "1000",
+    },
+    AssessmentProfile.CONSERVATIVE: {
+        "minimum_signal_score": "65",
+        "pre_scan_minimum_signal_score": "50",
+        "maximum_gap_percent": "12",
+        "minimum_catalyst_confidence": "0.60",
+        "pre_scan_minimum_catalyst_confidence": "0.40",
+        "minimum_dte": 14,
+        "maximum_dte": 45,
+        "execution_max_spread_ratio": "0.20",
+        "pre_scan_max_spread_ratio": "1.00",
+        "execution_min_open_interest": 25,
+        "pre_scan_min_open_interest": None,
+        "execution_max_quote_age_seconds": 120,
+        "pre_scan_max_quote_age_seconds": 86400,
+        "minimum_quote_size": "1",
+        "maximum_strike_distance_ratio": "0.30",
+        "require_greeks": True,
+        "max_investment_per_candidate": "250",
+        "maximum_contracts_per_candidate": 10,
+        "max_planned_loss_per_trade_pct_equity": "0.50",
+        "max_total_open_planned_loss_pct_equity": "4.0",
+        "max_underlying_risk_concentration_pct": "10",
+        "daily_loss_halt_pct_equity": "2",
+        "portfolio_drawdown_halt_pct": "10",
+        "max_concurrent_option_structures": 8,
+        "max_abs_portfolio_delta": "5000",
+        "max_abs_portfolio_gamma": "1000",
+        "max_abs_portfolio_theta": "1000",
+        "max_abs_portfolio_vega": "5000",
+    },
+    AssessmentProfile.FAIR: {
+        "minimum_signal_score": "55",
+        "pre_scan_minimum_signal_score": "40",
+        "maximum_gap_percent": "20",
+        "minimum_catalyst_confidence": "0.45",
+        "pre_scan_minimum_catalyst_confidence": "0.30",
+        "minimum_dte": 7,
+        "maximum_dte": 60,
+        "execution_max_spread_ratio": "0.30",
+        "pre_scan_max_spread_ratio": "1.25",
+        "execution_min_open_interest": 10,
+        "pre_scan_min_open_interest": 10,
+        "execution_max_quote_age_seconds": 300,
+        "pre_scan_max_quote_age_seconds": 172800,
+        "minimum_quote_size": "1",
+        "maximum_strike_distance_ratio": "0.30",
+        "require_greeks": True,
+        "max_investment_per_candidate": "500",
+        "maximum_contracts_per_candidate": 10,
+        "max_planned_loss_per_trade_pct_equity": "1.00",
+        "max_total_open_planned_loss_pct_equity": "6.0",
+        "max_underlying_risk_concentration_pct": "15",
+        "daily_loss_halt_pct_equity": "3",
+        "portfolio_drawdown_halt_pct": "12.5",
+        "max_concurrent_option_structures": 15,
+        "max_abs_portfolio_delta": "10000",
+        "max_abs_portfolio_gamma": "2500",
+        "max_abs_portfolio_theta": "2500",
+        "max_abs_portfolio_vega": "10000",
+    },
+    AssessmentProfile.AGGRESSIVE: {
+        "minimum_signal_score": "45",
+        "pre_scan_minimum_signal_score": "30",
+        "maximum_gap_percent": "30",
+        "minimum_catalyst_confidence": "0.30",
+        "pre_scan_minimum_catalyst_confidence": "0.20",
+        "minimum_dte": 3,
+        "maximum_dte": 90,
+        "execution_max_spread_ratio": "0.40",
+        "pre_scan_max_spread_ratio": "1.50",
+        "execution_min_open_interest": 5,
+        "pre_scan_min_open_interest": None,
+        "execution_max_quote_age_seconds": 300,
+        "pre_scan_max_quote_age_seconds": 604800,
+        "minimum_quote_size": "1",
+        "maximum_strike_distance_ratio": "0.30",
+        "require_greeks": True,
+        "max_investment_per_candidate": "750",
+        "maximum_contracts_per_candidate": 10,
+        "max_planned_loss_per_trade_pct_equity": "2.00",
+        "max_total_open_planned_loss_pct_equity": "8.0",
+        "max_underlying_risk_concentration_pct": "20",
+        "daily_loss_halt_pct_equity": "4",
+        "portfolio_drawdown_halt_pct": "15",
+        "max_concurrent_option_structures": 30,
+        "max_abs_portfolio_delta": "25000",
+        "max_abs_portfolio_gamma": "10000",
+        "max_abs_portfolio_theta": "10000",
+        "max_abs_portfolio_vega": "25000",
+    },
+    AssessmentProfile.VERY_AGGRESSIVE: {
+        "minimum_signal_score": "35",
+        "pre_scan_minimum_signal_score": "20",
+        "maximum_gap_percent": "50",
+        "minimum_catalyst_confidence": "0.20",
+        "pre_scan_minimum_catalyst_confidence": "0.10",
+        "minimum_dte": 1,
+        "maximum_dte": 180,
+        "execution_max_spread_ratio": "0.50",
+        "pre_scan_max_spread_ratio": "2.00",
+        "execution_min_open_interest": 1,
+        "pre_scan_min_open_interest": None,
+        "execution_max_quote_age_seconds": 300,
+        "pre_scan_max_quote_age_seconds": 604800,
+        "minimum_quote_size": "1",
+        "maximum_strike_distance_ratio": "0.30",
+        "require_greeks": True,
+        "max_investment_per_candidate": "1000",
+        "maximum_contracts_per_candidate": 10,
+        "max_planned_loss_per_trade_pct_equity": "3.00",
+        "max_total_open_planned_loss_pct_equity": "10.0",
+        "max_underlying_risk_concentration_pct": "25",
+        "daily_loss_halt_pct_equity": "5",
+        "portfolio_drawdown_halt_pct": "20",
+        "max_concurrent_option_structures": 100,
+        "max_abs_portfolio_delta": "100000",
+        "max_abs_portfolio_gamma": "100000",
+        "max_abs_portfolio_theta": "100000",
+        "max_abs_portfolio_vega": "100000",
+    },
+}
 
 
 class AssessmentPolicy(BaseModel):
@@ -110,6 +284,19 @@ class AssessmentPolicy(BaseModel):
             max_abs_portfolio_theta=self.max_abs_portfolio_theta,
             max_abs_portfolio_vega=self.max_abs_portfolio_vega,
         )
+
+
+def materialize_profile(profile: AssessmentProfile) -> AssessmentPolicy:
+    """Build a validated policy from the server-owned profile table."""
+    return AssessmentPolicy.model_validate(ASSESSMENT_PROFILE_VALUES[profile])
+
+
+def profile_for_policy(policy: AssessmentPolicy) -> AssessmentProfile | None:
+    """Return the exact named profile, or None for a manually customized policy."""
+    for profile in AssessmentProfile:
+        if policy == materialize_profile(profile):
+            return profile
+    return None
 
 
 def position_exposure(
