@@ -15,7 +15,7 @@ from alpaca.common.exceptions import APIError
 from anthropic import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import delete, or_, select
+from sqlalchemy import Select, delete, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from packages.ai.provider import (
@@ -2100,6 +2100,27 @@ async def approve_position_close_for_next_session(
         return _conditional_approval_view(record, position.symbol)
 
 
+def _conditional_approval_rejection_query(
+    workspace_id: UUID, approval_id: UUID
+) -> Select[tuple[ConditionalApprovalRecord, str]]:
+    return (
+        select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
+        .outerjoin(
+            ConnectedOpportunityRecord,
+            (ConnectedOpportunityRecord.workspace_id == ConditionalApprovalRecord.workspace_id)
+            & (
+                ConnectedOpportunityRecord.opportunity_id
+                == ConditionalApprovalRecord.opportunity_id
+            ),
+        )
+        .where(
+            ConditionalApprovalRecord.workspace_id == workspace_id,
+            ConditionalApprovalRecord.approval_id == approval_id,
+        )
+        .with_for_update(of=ConditionalApprovalRecord)
+    )
+
+
 @router.post("/approvals/{approval_id}/reject", response_model=ConditionalApprovalView)
 async def reject_conditional_approval(
     approval_id: UUID,
@@ -2109,20 +2130,7 @@ async def reject_conditional_approval(
     now = datetime.now(UTC)
     async with request.app.state.database.sessions.begin() as session:
         row = await session.execute(
-            select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
-            .outerjoin(
-                ConnectedOpportunityRecord,
-                (ConnectedOpportunityRecord.workspace_id == ConditionalApprovalRecord.workspace_id)
-                & (
-                    ConnectedOpportunityRecord.opportunity_id
-                    == ConditionalApprovalRecord.opportunity_id
-                ),
-            )
-            .where(
-                ConditionalApprovalRecord.workspace_id == context.workspace_id,
-                ConditionalApprovalRecord.approval_id == approval_id,
-            )
-            .with_for_update()
+            _conditional_approval_rejection_query(context.workspace_id, approval_id)
         )
         result = row.first()
         if result is None:
