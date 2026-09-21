@@ -49,6 +49,10 @@ describe("AdminConsole", () => {
     expect(await screen.findByRole("heading", { name: "Credential Settings" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Candidate Assessment" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Agent API & MCP" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "What the assessment returns" })).toBeInTheDocument();
+    expect(screen.getByText(/do not currently return the Market Scanner signal score/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Changing the assessment profile" })).toBeInTheDocument();
+    expect(screen.getByText(/cannot change the profile/i)).toBeInTheDocument();
     expect(screen.getByText("ADMINISTRATOR ACCESS")).toBeInTheDocument();
     expect(screen.queryByText("Ready for provider setup")).not.toBeInTheDocument();
     expect(screen.queryByText("CONNECTED PAPER WORKSPACE")).not.toBeInTheDocument();
