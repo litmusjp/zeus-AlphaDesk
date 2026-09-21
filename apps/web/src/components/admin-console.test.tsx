@@ -50,7 +50,7 @@ describe("AdminConsole", () => {
     expect(screen.queryByRole("heading", { name: "Candidate Assessment" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Agent API & MCP" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "What the assessment returns" })).toBeInTheDocument();
-    expect(screen.getByText(/do not currently return the Market Scanner signal score/i)).toBeInTheDocument();
+    expect(screen.getByText(/return the Market Scanner signal score when the request includes/i)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Changing the assessment profile" })).toBeInTheDocument();
     expect(screen.getByText(/cannot change the profile/i)).toBeInTheDocument();
     expect(screen.getByText("ADMINISTRATOR ACCESS")).toBeInTheDocument();

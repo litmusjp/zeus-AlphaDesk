@@ -8,6 +8,8 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.domain.workflow import CatalystFeatures
+from packages.strategy.catalyst import score_signal
 
 
 class AssessmentLeg(BaseModel):
@@ -46,6 +48,7 @@ class StrategyAssessmentRequest(BaseModel):
     legs: tuple[AssessmentLeg, ...] = Field(min_length=1, max_length=4)
     max_loss: Decimal = Field(ge=0)
     greeks: dict[str, Decimal]
+    market_scanner_features: CatalystFeatures | None = None
     market_evidence_at: datetime
     observed_at: datetime
     expires_at: datetime
@@ -77,6 +80,7 @@ class StrategyAssessmentResult(BaseModel):
     decision: Literal["PASS", "FAIL", "UNAVAILABLE"]
     assessment_id: UUID = Field(default_factory=uuid4)
     strategy_identity: dict[str, Any]
+    market_scanner_signal_score: Decimal | None = None
     checks: tuple[AssessmentCheck, ...]
     failed_check_codes: tuple[str, ...]
     policy_snapshot: dict[str, Any]
@@ -228,6 +232,11 @@ def assess_strategy(
             else "FAIL"
         )
     )
+    market_scanner_signal_score = (
+        score_signal(request.market_scanner_features)
+        if request.market_scanner_features is not None
+        else None
+    )
     return StrategyAssessmentResult(
         pass_=not failed,
         decision=decision,
@@ -237,6 +246,7 @@ def assess_strategy(
             "side": request.side,
             "quantity": request.quantity,
         },
+        market_scanner_signal_score=market_scanner_signal_score,
         checks=tuple(checks),
         failed_check_codes=failed,
         policy_snapshot=policy.model_dump(mode="json"),

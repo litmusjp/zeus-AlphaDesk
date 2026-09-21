@@ -6,6 +6,8 @@ from packages.connected.strategy_assessment import (
     StrategyAssessmentRequest,
     assess_strategy,
 )
+from packages.domain.workflow import CatalystFeatures
+from packages.strategy.catalyst import score_signal
 
 
 def payload(**overrides: object) -> StrategyAssessmentRequest:
@@ -70,6 +72,31 @@ def test_assessment_reuses_policy_and_returns_stable_checks() -> None:
     assert result.paper_only is True
     assert result.human_approval_required is True
     assert result.execution_allowed is False
+
+
+
+def test_assessment_returns_canonical_market_scanner_signal_score() -> None:
+    features = CatalystFeatures(
+        catalyst_confidence="0.90",
+        sentiment="0.80",
+        relative_volume="3.0",
+        price_momentum="0.70",
+        gap_percent="1.0",
+        market_confirmation="0.60",
+        sector_confirmation="0.50",
+        liquidity_score="0.90",
+    )
+    result = assess_strategy(
+        payload(market_scanner_features=features),
+        AssessmentPolicy(),
+        paper_equity=Decimal("10000"),
+    )
+    assert result.market_scanner_signal_score == score_signal(features)
+
+
+def test_assessment_returns_no_signal_score_without_market_features() -> None:
+    result = assess_strategy(payload(), AssessmentPolicy(), paper_equity=Decimal("10000"))
+    assert result.market_scanner_signal_score is None
 
 
 def test_malformed_or_stale_strategy_fails_closed() -> None:
