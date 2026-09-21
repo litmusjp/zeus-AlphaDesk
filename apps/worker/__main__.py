@@ -30,7 +30,10 @@ from packages.database.models import (
 from packages.database.session import Database
 from packages.domain.system import TradingEnvironment
 from packages.event_bus.client import JetStreamEventBus
-from packages.execution.conditional_exit_runner import process_workspace_exit_approvals
+from packages.execution.conditional_exit_runner import (
+    process_workspace_exit_approvals,
+    queue_triggered_exit_plans,
+)
 from packages.execution.conditional_runner import process_workspace_approvals
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.observability.logging import configure_logging, get_logger
@@ -478,6 +481,11 @@ async def _scanner_supervisor(
                     cipher=cipher,
                     workspace_id=workspace.workspace_id,
                     now=now,
+                )
+                await queue_triggered_exit_plans(
+                    database=database,
+                    cipher=cipher,
+                    workspace_id=workspace.workspace_id,
                 )
                 await process_workspace_exit_approvals(
                     database=database,

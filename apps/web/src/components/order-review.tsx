@@ -13,7 +13,8 @@ type RiskDecision = { decision?: string; checks?: RiskCheck[] };
 type OrderIntent = { client_order_id: string; quantity: number; limit_price: string };
 type OptionDiagnostics = { total_contracts: number; requested_type_contracts: number; strict_eligible_contracts: number; selected_contracts: number; rejection_counts: Record<string, number> };
 type Analysis = { opportunity_id: string; symbol: string; disposition: string; source: string; observed_at: string; expires_at: string; signal: Record<string, unknown>; candidate: Candidate | null; risk_decision: RiskDecision | null; order_intent: OrderIntent | null; option_diagnostics: OptionDiagnostics | null; reason_codes: string[] };
-type ConditionalApproval = { approval_id: string; opportunity_id: string; state: string; session_date: string; approved_at: string; expires_at: string; max_limit_price: string; max_loss: string; max_quantity: number; max_quote_age_seconds: number; failure_reason: string | null };
+type ExitPlan = { stop_loss: string; profit_target: string | null; expires_at: string; stale_data_behavior: "FAIL_CLOSED"; };
+type ConditionalApproval = { approval_id: string; opportunity_id: string; state: string; session_date: string; approved_at: string; expires_at: string; max_limit_price: string; max_loss: string; max_quantity: number; max_quote_age_seconds: number; failure_reason: string | null; exit_plan: ExitPlan | null };
 type Workspace = { trading_environment: "PAPER" | "LIVE" };
 
 export function OrderReview({ id }: { id: string }) {
@@ -24,6 +25,9 @@ export function OrderReview({ id }: { id: string }) {
   const [now, setNow] = useState<Date | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [liveConfirmation, setLiveConfirmation] = useState("");
+  const [stopLoss, setStopLoss] = useState("");
+  const [profitTarget, setProfitTarget] = useState("");
+  const [exitExpiry, setExitExpiry] = useState("");
 
   const refresh = useCallback(async () => {
     const [nextOpportunity, approvals, nextWorkspace] = await Promise.all([
@@ -34,7 +38,10 @@ export function OrderReview({ id }: { id: string }) {
     setOpportunity(nextOpportunity);
     setApproval(approvals.find((item) => item.opportunity_id === id) ?? null);
     setWorkspace(nextWorkspace);
-  }, [id]);
+    if (nextOpportunity.candidate?.structure?.max_loss && !stopLoss) setStopLoss(nextOpportunity.candidate.structure.max_loss);
+    if (nextOpportunity.candidate?.structure?.max_profit && !profitTarget) setProfitTarget(nextOpportunity.candidate.structure.max_profit);
+    if (!exitExpiry) setExitExpiry(nextOpportunity.expires_at.slice(0, 16));
+  }, [exitExpiry, id, profitTarget, stopLoss]);
 
   useEffect(() => {
     const kickoff = setTimeout(() => {
@@ -59,7 +66,7 @@ export function OrderReview({ id }: { id: string }) {
   const checks = opportunity.risk_decision?.checks ?? [];
   const recommendedQuantity = intent?.quantity ?? structure?.quantity;
   const recommendedLimit = intent?.limit_price ?? structure?.net_premium_per_share;
-  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure) && recommendedQuantity !== undefined && recommendedLimit !== undefined;
+  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure) && recommendedQuantity !== undefined && recommendedLimit !== undefined && Boolean(stopLoss) && Boolean(exitExpiry);
   const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state) || (approval.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() <= now.getTime());
   const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() > now.getTime();
 
@@ -75,6 +82,7 @@ export function OrderReview({ id }: { id: string }) {
           max_loss: structure.max_loss,
           max_quantity: recommendedQuantity,
           max_quote_age_seconds: 30,
+          exit_plan: { stop_loss: stopLoss, profit_target: profitTarget || null, expires_at: new Date(exitExpiry).toISOString(), stale_data_behavior: "FAIL_CLOSED" },
           live_order_confirmation: workspace?.trading_environment === "LIVE" ? liveConfirmation : null,
         }),
       });
@@ -118,7 +126,7 @@ export function OrderReview({ id }: { id: string }) {
       </section>
       <aside className="control-panel confirmation-panel">
         <Clock3 /><small>CONDITIONAL NEXT-SESSION APPROVAL</small>
-        {approval ? <><strong>{approval.state.replaceAll("_", " ")}</strong><p>Session: {approval.session_date}<br />Maximum price: ${approval.max_limit_price}<br />Maximum loss: ${approval.max_loss}<br />Quote age: {approval.max_quote_age_seconds}s</p>{approval.failure_reason ? <p className="form-message">Reason: {approval.failure_reason}</p> : null}</> : <p>Approve once before sleep. At the next U.S. session open, the worker checks the live structure, quote, risk, and broker state before submitting.</p>}
+        {approval ? <><strong>{approval.state.replaceAll("_", " ")}</strong><p>Session: {approval.session_date}<br />Maximum price: ${approval.max_limit_price}<br />Maximum loss: ${approval.max_loss}<br />Quote age: {approval.max_quote_age_seconds}s</p><p>Opening approval does not protect an active position unless an exit plan is present.</p>{approval.exit_plan ? <p>Exit plan: stop loss ${approval.exit_plan.stop_loss}{approval.exit_plan.profit_target ? ` · profit target $${approval.exit_plan.profit_target}` : ""} · expiry {new Date(approval.exit_plan.expires_at).toLocaleString()} · stale evidence: fail closed.</p> : <p className="form-message">No exit plan: this approval is not overnight-protected.</p>}{approval.failure_reason ? <p className="form-message">Reason: {approval.failure_reason}</p> : null}</> : <><p>Opening approval does not protect an active position unless the exit plan below is present. The worker revalidates every gate before submitting.</p><label>Maximum loss exit<input value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} inputMode="decimal" /></label><label>Profit target exit (optional)<input value={profitTarget} onChange={(event) => setProfitTarget(event.target.value)} inputMode="decimal" /></label><label>Time-based exit<input type="datetime-local" value={exitExpiry} onChange={(event) => setExitExpiry(event.target.value)} /></label><p>Stale broker or market evidence: fail closed; no unguarded exit.</p></>}
         {workspace?.trading_environment === "LIVE" && canRenewApproval ? <label>Type ENABLE LIVE TRADING to confirm this exact first live order<input value={liveConfirmation} onChange={(event) => setLiveConfirmation(event.target.value)} /></label> : null}
         {approvalCanReject ? <button className="secondary-button" disabled={busy} onClick={() => void rejectApproval()}>Reject approval</button> : canRenewApproval ? <button disabled={!canApprove || busy || (workspace?.trading_environment === "LIVE" && liveConfirmation !== "ENABLE LIVE TRADING")} onClick={() => void approveForSession()}>Approve for next U.S. session</button> : null}
       </aside>

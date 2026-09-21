@@ -462,6 +462,26 @@ class ConditionalApprovalStore:
             )
             return record
 
+    async def list_openings_with_exit_plans(
+        self, *, workspace_id: UUID
+    ) -> list[ConditionalApprovalRecord]:
+        """Return filled openings whose immutable plan still needs evaluation."""
+        async with self._database.sessions() as session:
+            return list(
+                await session.scalars(
+                    select(ConditionalApprovalRecord)
+                    .where(
+                        ConditionalApprovalRecord.workspace_id == workspace_id,
+                        ConditionalApprovalRecord.approval_kind == "OPEN",
+                        ConditionalApprovalRecord.state.in_(
+                            [ApprovalState.PARTIALLY_FILLED, ApprovalState.FILLED]
+                        ),
+                        ConditionalApprovalRecord.exit_plan_payload.is_not(None),
+                    )
+                    .order_by(ConditionalApprovalRecord.created_at)
+                )
+            )
+
     async def finish(
         self,
         approval_id: UUID,

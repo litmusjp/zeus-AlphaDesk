@@ -26,6 +26,7 @@ from packages.execution.conditional_approval import (
     candidate_structure_identity,
     order_structure_fingerprint,
     revalidate_for_submission,
+    validate_exit_plan,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.execution.connected_paper import execute_connected_order
@@ -265,6 +266,15 @@ async def process_workspace_approvals(
                     reason="approved_snapshot_missing",
                 )
                 continue
+            invalid_exit_plan = validate_exit_plan(approval_record.exit_plan_payload)
+            if invalid_exit_plan:
+                await _finish(
+                    approval_record.approval_id,
+                    state=ApprovalState.CONDITION_FAILED,
+                    now=now,
+                    reason=invalid_exit_plan,
+                )
+                continue
             approved_intent = OrderIntent.model_validate(approval_record.approved_intent_payload)
             if workspace is None:
                 await _finish(
@@ -366,6 +376,7 @@ async def process_workspace_approvals(
                 max_quantity=approval_record.max_quantity,
                 max_quote_age_seconds=approval_record.max_quote_age_seconds,
                 state=ApprovalState.APPROVED_FOR_SESSION,
+                exit_plan=approval_record.exit_plan_payload,
             )
             if fresh.observed_at > now:
                 await _finish(

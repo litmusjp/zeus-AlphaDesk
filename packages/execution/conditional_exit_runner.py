@@ -4,8 +4,10 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from math import ceil
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
+
+from sqlalchemy import select
 
 from packages.broker.adapter import BrokerPreflightFailed
 from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
@@ -17,8 +19,11 @@ from packages.execution.conditional_approval import (
     ApprovalState,
     ConditionalExitApproval,
     ExitOrderSide,
+    ExitPlanDecision,
     RevalidationDecision,
+    evaluate_exit_plan,
     revalidate_exit_for_submission,
+    validate_exit_plan,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.execution.order_state import BrokerFillState, broker_fill_state
@@ -35,6 +40,139 @@ class PreSubmissionCheckFailed(RuntimeError):
 
 class SubmissionAttempted(RuntimeError):
     pass
+
+
+async def queue_triggered_exit_plans(
+    *, database: Database, cipher: CredentialCipher, workspace_id: UUID
+) -> None:
+    """Turn a triggered immutable plan into the existing fenced CLOSE workflow.
+
+    This deliberately supports only a single-leg option opening. Multi-leg
+    close construction needs a first-class structure-level broker projection;
+    it is rejected rather than guessed.
+    """
+    store = ConditionalApprovalStore(database)
+    openings = await store.list_openings_with_exit_plans(workspace_id=workspace_id)
+    if not openings:
+        return
+    async with database.sessions() as session:
+        workspace = await session.get(WorkspaceRecord, workspace_id)
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
+    if secret is None:
+        return
+    broker = AlpacaBrokerAdapter(
+        str(secret["api_key_id"]), str(secret["secret_key"]), environment=environment
+    )
+    try:
+        snapshot = await broker.reconcile()
+    finally:
+        await broker.close()
+    for opening in openings:
+        plan = opening.exit_plan_payload
+        if validate_exit_plan(plan):
+            continue
+        assert isinstance(plan, dict)
+        try:
+            legs = (
+                opening.approved_intent_payload["legs"]
+                if opening.approved_intent_payload
+                else []
+            )
+            if len(legs) != 1:
+                continue
+            symbol = str(legs[0]["symbol"])
+            position = next(
+                (item for item in snapshot.positions if item.symbol == symbol), None
+            )
+            if position is None or position.asset_class.lower() != "us_option":
+                continue
+            if position.quantity <= 0 or position.current_price is None:
+                continue
+            quoted_at = position.as_of
+            if quoted_at.tzinfo is None:
+                quoted_at = quoted_at.replace(tzinfo=UTC)
+            now = datetime.now(UTC)
+            age = max(0, ceil((now - quoted_at).total_seconds()))
+            evaluation = evaluate_exit_plan(
+                plan,
+                now=now,
+                structure_fingerprint=opening.structure_fingerprint,
+                broker_account_id=snapshot.account.account_id,
+                environment=snapshot.account.environment,
+                unrealized_pl=position.unrealized_pl,
+                quote_age_seconds=age,
+                max_quote_age_seconds=opening.max_quote_age_seconds,
+            )
+            if evaluation.decision is not ExitPlanDecision.CLOSE:
+                continue
+            if position.quantity != position.quantity.to_integral_value():
+                continue
+            order_side = ExitOrderSide.SELL if position.side == "long" else ExitOrderSide.BUY
+            session_date = now.astimezone(ZoneInfo("America/New_York")).date()
+            structure_fingerprint = (
+                f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{position.quantity}"
+            )
+            async with database.sessions.begin() as session:
+                existing = await session.scalar(
+                    select(ConditionalApprovalRecord)
+                    .where(
+                        ConditionalApprovalRecord.workspace_id == workspace_id,
+                        ConditionalApprovalRecord.approval_kind == "CLOSE",
+                        ConditionalApprovalRecord.position_asset_id == position.asset_id,
+                        ConditionalApprovalRecord.session_date == session_date,
+                    )
+                    .with_for_update()
+                )
+                if existing is not None:
+                    continue
+                session.add(
+                    ConditionalApprovalRecord(
+                        approval_id=uuid4(),
+                        workspace_id=workspace_id,
+                        opportunity_id=None,
+                        approved_by_user_id=opening.approved_by_user_id,
+                        approved_broker_account_id=snapshot.account.account_id,
+                        state=ApprovalState.APPROVED_FOR_SESSION,
+                        approval_kind="CLOSE",
+                        session_date=session_date,
+                        approved_at=now,
+                        expires_at=datetime.fromisoformat(
+                            str(plan["expires_at"]).replace("Z", "+00:00")
+                        ),
+                        client_order_id=f"ad-exit-{opening.approval_id.hex[:16]}-{position.asset_id[:12]}",
+                        structure_fingerprint=structure_fingerprint,
+                        approved_intent_payload={"opening_approval_id": str(opening.approval_id)},
+                        approved_structure_identity={
+                            "opening_structure_fingerprint": opening.structure_fingerprint
+                        },
+                        exit_plan_payload=plan,
+                        max_limit_price=(
+                            position.current_price
+                            if order_side is ExitOrderSide.BUY
+                            else Decimal("0")
+                        ),
+                        min_limit_price=(
+                            position.current_price
+                            if order_side is ExitOrderSide.SELL
+                            else None
+                        ),
+                        max_loss=Decimal("0"),
+                        max_quantity=int(position.quantity),
+                        max_quote_age_seconds=opening.max_quote_age_seconds,
+                        position_asset_id=position.asset_id,
+                        position_symbol=position.symbol,
+                        position_side=position.side,
+                        exit_order_side=order_side.value,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            continue
 
 
 def _broker_order_state(
@@ -418,6 +556,23 @@ async def _process_claimed_exit(
         )
         return
     quote_age_seconds = max(0, ceil((now - quoted_at).total_seconds()))
+    if record.exit_plan_payload is not None:
+        invalid_plan = validate_exit_plan(record.exit_plan_payload)
+        if invalid_plan:
+            raise PreSubmissionCheckFailed(invalid_plan)
+        plan = record.exit_plan_payload
+        plan_eval = evaluate_exit_plan(
+            plan,
+            now=now,
+            structure_fingerprint=str(plan["structure_fingerprint"]),
+            broker_account_id=record.approved_broker_account_id or "",
+            environment=environment.value,
+            unrealized_pl=position.unrealized_pl,
+            quote_age_seconds=quote_age_seconds,
+            max_quote_age_seconds=record.max_quote_age_seconds,
+        )
+        if plan_eval.decision is not ExitPlanDecision.CLOSE:
+            raise PreSubmissionCheckFailed(plan_eval.reason)
     limit_price = quote.bid if order_side is ExitOrderSide.SELL else quote.ask
     if not limit_price.is_finite() or limit_price <= 0:
         await _finish(

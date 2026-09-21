@@ -76,6 +76,7 @@ from packages.execution.conditional_approval import (
     approval_is_active,
     candidate_structure_identity,
     order_structure_fingerprint,
+    validate_exit_plan,
 )
 from packages.execution.connected_paper import execute_connected_paper_order
 from packages.execution.engine import SubmissionUncertain
@@ -264,6 +265,15 @@ class ConfirmPaperOrder(BaseModel):
     client_order_id: str = Field(min_length=10, max_length=64)
 
 
+class ExitPlanInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stop_loss: Decimal = Field(gt=0)
+    profit_target: Decimal | None = Field(default=None, gt=0)
+    expires_at: datetime
+    stale_data_behavior: Literal["FAIL_CLOSED"]
+
+
 class ConditionalApprovalInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -272,6 +282,7 @@ class ConditionalApprovalInput(BaseModel):
     max_quantity: int | None = Field(default=None, ge=1, le=100)
     max_quote_age_seconds: int = Field(default=30, ge=1, le=300)
     live_order_confirmation: str | None = None
+    exit_plan: ExitPlanInput | None = None
 
 
 class ConditionalExitApprovalInput(BaseModel):
@@ -304,6 +315,7 @@ class ConditionalApprovalView(BaseModel):
     exit_order_side: str | None
     broker_order_id: str | None
     failure_reason: str | None
+    exit_plan: dict[str, Any] | None
 
 
 def _credential_store(request: Request) -> CredentialStore:
@@ -387,6 +399,7 @@ def _conditional_approval_view(
         exit_order_side=record.exit_order_side,
         broker_order_id=record.broker_order_id,
         failure_reason=record.failure_reason,
+        exit_plan=getattr(record, "exit_plan_payload", None),
     )
 
 
@@ -1738,6 +1751,13 @@ async def approve_for_next_session(
         )
         if broker_account is None:
             raise HTTPException(status_code=409, detail="Target broker account is not reconciled")
+        if payload.exit_plan is None:
+            raise HTTPException(
+                status_code=409,
+                detail="An explicit exit plan is required; opening approval is not exit protection",
+            )
+        if payload.exit_plan.expires_at <= now:
+            raise HTTPException(status_code=422, detail="Exit plan expiry must be in the future")
         live_confirmation = None
         if workspace.trading_environment == TradingEnvironment.LIVE.value:
             if payload.live_order_confirmation != LIVE_CONFIRMATION_PHRASE:
@@ -1788,6 +1808,18 @@ async def approve_for_next_session(
                 )
             _validate_open_approval_renewal(existing, intent)
             record = existing
+            exit_plan = payload.exit_plan.model_dump(mode="json")
+            exit_plan.update(
+                {
+                    "opening_approval_id": str(record.approval_id),
+                    "structure_fingerprint": order_structure_fingerprint(intent),
+                    "broker_account_id": broker_account.account_id,
+                    "environment": workspace.trading_environment,
+                }
+            )
+            invalid_exit_plan = validate_exit_plan(exit_plan)
+            if invalid_exit_plan:
+                raise HTTPException(status_code=422, detail=invalid_exit_plan)
             record.approved_by_user_id = context.principal.user_id
             record.state = ApprovalState.APPROVED_FOR_SESSION
             record.approval_kind = "OPEN"
@@ -1797,6 +1829,7 @@ async def approve_for_next_session(
             record.structure_fingerprint = order_structure_fingerprint(intent)
             record.approved_intent_payload = intent.model_dump(mode="json")
             record.approved_structure_identity = candidate_structure_identity(candidate)
+            record.exit_plan_payload = exit_plan
             record.approved_broker_account_id = broker_account.account_id
             record.execution_environment = workspace.trading_environment
             record.live_order_confirmation = live_confirmation
@@ -1812,8 +1845,21 @@ async def approve_for_next_session(
             record.updated_at = now
             approval_action = "CONDITIONAL_APPROVAL_RENEWED"
         else:
+            approval_id = uuid4()
+            exit_plan = payload.exit_plan.model_dump(mode="json")
+            exit_plan.update(
+                {
+                    "opening_approval_id": str(approval_id),
+                    "structure_fingerprint": order_structure_fingerprint(intent),
+                    "broker_account_id": broker_account.account_id,
+                    "environment": workspace.trading_environment,
+                }
+            )
+            invalid_exit_plan = validate_exit_plan(exit_plan)
+            if invalid_exit_plan:
+                raise HTTPException(status_code=422, detail=invalid_exit_plan)
             record = ConditionalApprovalRecord(
-                approval_id=uuid4(),
+                approval_id=approval_id,
                 workspace_id=context.workspace_id,
                 opportunity_id=opportunity_id,
                 approved_by_user_id=context.principal.user_id,
@@ -1826,6 +1872,7 @@ async def approve_for_next_session(
                 structure_fingerprint=order_structure_fingerprint(intent),
                 approved_intent_payload=intent.model_dump(mode="json"),
                 approved_structure_identity=candidate_structure_identity(candidate),
+                exit_plan_payload=exit_plan,
                 approved_broker_account_id=broker_account.account_id,
                 execution_environment=workspace.trading_environment,
                 live_order_confirmation=live_confirmation,

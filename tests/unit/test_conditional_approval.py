@@ -11,11 +11,14 @@ from packages.execution.conditional_approval import (
     ConditionalApproval,
     ConditionalExitApproval,
     ExitOrderSide,
+    ExitPlanDecision,
     RevalidationDecision,
     approval_can_be_renewed,
     approval_is_active,
+    evaluate_exit_plan,
     revalidate_exit_for_submission,
     revalidate_for_submission,
+    validate_exit_plan,
 )
 from packages.execution.conditional_runner import _open_fill_response_is_valid
 from packages.execution.conditional_store import (
@@ -57,6 +60,88 @@ def test_revalidation_allows_one_approved_session_submission() -> None:
     )
 
     assert result.decision is RevalidationDecision.READY_TO_SUBMIT
+
+
+def test_next_session_open_approval_requires_an_explicit_exit_plan() -> None:
+    assert validate_exit_plan(None) is not None
+
+
+def valid_exit_plan(**overrides: object) -> dict[str, object]:
+    plan: dict[str, object] = {
+        "opening_approval_id": "opening-1",
+        "structure_fingerprint": "AAPL-20261016-200C-205C",
+        "broker_account_id": "paper-account-1",
+        "environment": "PAPER",
+        "stop_loss": "220",
+        "profit_target": "100",
+        "expires_at": "2026-09-19T20:00:00+00:00",
+        "stale_data_behavior": "FAIL_CLOSED",
+    }
+    plan.update(overrides)
+    return plan
+
+
+@pytest.mark.parametrize(
+    ("pl", "reason"),
+    [(Decimal("-220"), "exit_plan_stop_loss"), (Decimal("100"), "exit_plan_profit_target")],
+)
+def test_exit_plan_evaluates_protection_and_planned_profit_taking(
+    pl: Decimal, reason: str
+) -> None:
+    result = evaluate_exit_plan(
+        valid_exit_plan(),
+        now=datetime(2026, 9, 18, 14, 31, tzinfo=UTC),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=pl,
+        quote_age_seconds=4,
+        max_quote_age_seconds=30,
+    )
+    assert result.decision is ExitPlanDecision.CLOSE
+    assert result.reason == reason
+
+
+def test_exit_plan_fails_closed_for_stale_evidence_and_binding_mismatch() -> None:
+    stale = evaluate_exit_plan(
+        valid_exit_plan(),
+        now=datetime(2026, 9, 18, 14, 31, tzinfo=UTC),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=Decimal("-1000"),
+        quote_age_seconds=31,
+        max_quote_age_seconds=30,
+    )
+    wrong_binding = evaluate_exit_plan(
+        valid_exit_plan(),
+        now=datetime(2026, 9, 18, 14, 31, tzinfo=UTC),
+        structure_fingerprint="changed",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=Decimal("-1000"),
+        quote_age_seconds=4,
+        max_quote_age_seconds=30,
+    )
+    assert stale.decision is ExitPlanDecision.FAIL_CLOSED
+    assert stale.reason == "stale_exit_evidence"
+    assert wrong_binding.decision is ExitPlanDecision.FAIL_CLOSED
+    assert wrong_binding.reason == "exit_plan_binding_mismatch"
+
+
+def test_exit_plan_evaluates_time_expiry() -> None:
+    result = evaluate_exit_plan(
+        valid_exit_plan(),
+        now=datetime(2026, 9, 19, 20, tzinfo=UTC),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=Decimal("10"),
+        quote_age_seconds=4,
+        max_quote_age_seconds=30,
+    )
+    assert result.decision is ExitPlanDecision.CLOSE
+    assert result.reason == "exit_plan_expired"
 
 
 def test_revalidation_rejects_price_outside_approved_bound() -> None:

@@ -236,6 +236,9 @@ class ConditionalApprovalRecord(Base):
     structure_fingerprint: Mapped[str] = mapped_column(String(512))
     approved_intent_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     approved_structure_identity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Immutable safety plan for OPEN approvals. NULL is intentional for legacy
+    # rows: those rows are never treated as overnight-protected.
+    exit_plan_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     approved_broker_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     max_limit_price: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     max_loss: Mapped[Decimal] = mapped_column(Numeric(20, 8))

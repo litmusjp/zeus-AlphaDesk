@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from packages.domain.workflow import OrderIntent, RankedCandidate
@@ -36,6 +37,90 @@ class RevalidationDecision(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class ExitPlanDecision(StrEnum):
+    HOLD = "HOLD"
+    CLOSE = "CLOSE"
+    FAIL_CLOSED = "FAIL_CLOSED"
+
+
+@dataclass(frozen=True)
+class ExitPlanEvaluation:
+    decision: ExitPlanDecision
+    reason: str
+
+
+def validate_exit_plan(plan: object) -> str | None:
+    """Validate the persisted, immutable plan; missing/legacy plans are unsafe."""
+    if not isinstance(plan, dict):
+        return "exit_plan_missing"
+    required = {
+        "opening_approval_id",
+        "structure_fingerprint",
+        "broker_account_id",
+        "environment",
+        "stop_loss",
+        "expires_at",
+        "stale_data_behavior",
+    }
+    if not required.issubset(plan):
+        return "exit_plan_incomplete"
+    try:
+        stop_loss = Decimal(str(plan["stop_loss"]))
+        if not stop_loss.is_finite() or stop_loss <= 0:
+            return "exit_plan_stop_loss_invalid"
+        if plan.get("profit_target") is not None:
+            target = Decimal(str(plan["profit_target"]))
+            if not target.is_finite() or target <= 0:
+                return "exit_plan_profit_target_invalid"
+        expiry = datetime.fromisoformat(str(plan["expires_at"]).replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            return "exit_plan_expiry_not_timezone_aware"
+        if not str(plan["opening_approval_id"]) or not str(plan["structure_fingerprint"]):
+            return "exit_plan_binding_missing"
+        if not str(plan["broker_account_id"]) or str(plan["environment"]) not in {"PAPER", "LIVE"}:
+            return "exit_plan_binding_invalid"
+    except (TypeError, ValueError, ArithmeticError):
+        return "exit_plan_value_invalid"
+    if plan["stale_data_behavior"] != "FAIL_CLOSED":
+        return "exit_plan_stale_data_policy_invalid"
+    return None
+
+
+def evaluate_exit_plan(
+    plan: object,
+    *,
+    now: datetime,
+    structure_fingerprint: str,
+    broker_account_id: str,
+    environment: str,
+    unrealized_pl: Decimal,
+    quote_age_seconds: int,
+    max_quote_age_seconds: int,
+) -> ExitPlanEvaluation:
+    invalid = validate_exit_plan(plan)
+    if invalid:
+        return ExitPlanEvaluation(ExitPlanDecision.FAIL_CLOSED, invalid)
+    assert isinstance(plan, dict)
+    if (
+        plan["structure_fingerprint"] != structure_fingerprint
+        or plan["broker_account_id"] != broker_account_id
+        or plan["environment"] != environment
+    ):
+        return ExitPlanEvaluation(ExitPlanDecision.FAIL_CLOSED, "exit_plan_binding_mismatch")
+    if quote_age_seconds < 0 or quote_age_seconds > max_quote_age_seconds:
+        return ExitPlanEvaluation(ExitPlanDecision.FAIL_CLOSED, "stale_exit_evidence")
+    expiry = datetime.fromisoformat(str(plan["expires_at"]).replace("Z", "+00:00"))
+    if now >= expiry:
+        return ExitPlanEvaluation(ExitPlanDecision.CLOSE, "exit_plan_expired")
+    loss = Decimal(str(plan["stop_loss"]))
+    if unrealized_pl <= -loss:
+        return ExitPlanEvaluation(ExitPlanDecision.CLOSE, "exit_plan_stop_loss")
+    target = plan.get("profit_target")
+    if target is not None and unrealized_pl >= Decimal(str(target)):
+        return ExitPlanEvaluation(ExitPlanDecision.CLOSE, "exit_plan_profit_target")
+    return ExitPlanEvaluation(ExitPlanDecision.HOLD, "exit_plan_not_triggered")
+
+
 def approval_is_active(state: ApprovalState | str, expires_at: datetime, now: datetime) -> bool:
     normalized_state = ApprovalState(state)
     if normalized_state is ApprovalState.REVALIDATING:
@@ -66,6 +151,7 @@ class ConditionalApproval:
     max_quantity: int
     max_quote_age_seconds: int
     state: ApprovalState
+    exit_plan: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
