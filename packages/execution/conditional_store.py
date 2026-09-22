@@ -428,18 +428,25 @@ class ConditionalApprovalStore:
         return len(records)
 
     async def claim_next(
-        self, *, workspace_id: UUID, session_date: date, now: datetime, approval_kind: str = "OPEN"
+        self,
+        *,
+        workspace_id: UUID,
+        now: datetime,
+        approval_kind: str = "OPEN",
+        session_date: date | None = None,
     ) -> ConditionalApprovalRecord | None:
+        predicates = [
+            ConditionalApprovalRecord.workspace_id == workspace_id,
+            ConditionalApprovalRecord.approval_kind == approval_kind,
+            ConditionalApprovalRecord.state == ApprovalState.APPROVED_FOR_SESSION,
+            ConditionalApprovalRecord.expires_at > now,
+        ]
+        if session_date is not None:
+            predicates.append(ConditionalApprovalRecord.session_date == session_date)
         async with self._database.sessions.begin() as session:
             record = await session.scalar(
                 select(ConditionalApprovalRecord)
-                .where(
-                    ConditionalApprovalRecord.workspace_id == workspace_id,
-                    ConditionalApprovalRecord.approval_kind == approval_kind,
-                    ConditionalApprovalRecord.session_date == session_date,
-                    ConditionalApprovalRecord.state == ApprovalState.APPROVED_FOR_SESSION,
-                    ConditionalApprovalRecord.expires_at > now,
-                )
+                .where(*predicates)
                 .order_by(ConditionalApprovalRecord.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -461,6 +468,88 @@ class ConditionalApprovalStore:
                 )
             )
             return record
+
+    async def release_revalidation(
+        self,
+        approval_id: UUID,
+        *,
+        workspace_id: UUID,
+        claim_token: UUID,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        """Return a safely claimed approval to the durable pending state."""
+        async with self._database.sessions.begin() as session:
+            record = await session.scalar(
+                select(ConditionalApprovalRecord)
+                .where(
+                    ConditionalApprovalRecord.approval_id == approval_id,
+                    ConditionalApprovalRecord.workspace_id == workspace_id,
+                    ConditionalApprovalRecord.claim_token == claim_token,
+                    ConditionalApprovalRecord.state == ApprovalState.REVALIDATING,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                return
+            record.state = ApprovalState.APPROVED_FOR_SESSION
+            record.claimed_at = None
+            record.claim_token = None
+            record.failure_reason = reason
+            record.updated_at = now
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=workspace_id,
+                    actor_user_id=None,
+                    action="CONDITIONAL_APPROVAL_REVALIDATION_DEFERRED",
+                    detail={"approval_id": str(approval_id), "reason": reason},
+                    occurred_at=now,
+                )
+            )
+
+    async def release_submission(
+        self,
+        approval_id: UUID,
+        *,
+        workspace_id: UUID,
+        claim_token: UUID,
+        submission_token: UUID,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        """Return a fenced pre-submit failure to durable approval pending state."""
+        async with self._database.sessions.begin() as session:
+            record = await session.scalar(
+                select(ConditionalApprovalRecord)
+                .where(
+                    ConditionalApprovalRecord.approval_id == approval_id,
+                    ConditionalApprovalRecord.workspace_id == workspace_id,
+                    ConditionalApprovalRecord.claim_token == claim_token,
+                    ConditionalApprovalRecord.submission_token == submission_token,
+                    ConditionalApprovalRecord.state == ApprovalState.SUBMITTING,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                return
+            record.state = ApprovalState.APPROVED_FOR_SESSION
+            record.claimed_at = None
+            record.claim_token = None
+            record.submission_claimed_at = None
+            record.submission_token = None
+            record.failure_reason = reason
+            record.updated_at = now
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=workspace_id,
+                    actor_user_id=None,
+                    action="CONDITIONAL_APPROVAL_SUBMISSION_DEFERRED",
+                    detail={"approval_id": str(approval_id), "reason": reason},
+                    occurred_at=now,
+                )
+            )
 
     async def list_openings_with_exit_plans(
         self, *, workspace_id: UUID

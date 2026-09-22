@@ -176,11 +176,15 @@ def test_revalidation_rejects_stale_quote_and_wrong_structure() -> None:
     assert result.reason in {"structure_changed", "quote_stale"}
 
 
-def test_revalidation_expires_outside_approved_session() -> None:
+def test_revalidation_allows_next_broker_session_after_holiday_or_early_close() -> None:
     result = revalidate_for_submission(
-        approval(),
-        now=datetime(2026, 9, 19, 14, 31, tzinfo=UTC),
-        session_date=date(2026, 9, 19),
+        approval(expires_at=datetime(2026, 9, 22, 20, tzinfo=UTC)),
+        # The approval was created for the prior local date.  The broker clock
+        # has already advanced to the next valid regular session (for example
+        # after a holiday or an early close), so local-date equality is not an
+        # execution authorization.
+        now=datetime(2026, 9, 21, 14, 31, tzinfo=UTC),
+        session_date=date(2026, 9, 21),
         structure_fingerprint="AAPL-20261016-200C-205C",
         limit_price=Decimal("2.08"),
         maximum_loss=Decimal("208"),
@@ -188,8 +192,7 @@ def test_revalidation_expires_outside_approved_session() -> None:
         quote_age_seconds=4,
     )
 
-    assert result.decision is RevalidationDecision.EXPIRED
-    assert result.reason == "approval_session_mismatch"
+    assert result.decision is RevalidationDecision.READY_TO_SUBMIT
 
 
 def test_expired_approval_is_not_active_and_can_be_renewed() -> None:

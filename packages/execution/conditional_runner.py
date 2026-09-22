@@ -5,13 +5,13 @@ from decimal import Decimal
 from math import ceil
 from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
 from packages.broker.alpaca_adapter import AlpacaBrokerAdapter
 from packages.broker.validation import validate_broker_order_leg_identity
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
 from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import ConnectedOpportunityRecord, WorkspaceRecord
@@ -29,7 +29,7 @@ from packages.execution.conditional_approval import (
     validate_exit_plan,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
-from packages.execution.connected_paper import execute_connected_order
+from packages.execution.connected_paper import PreSubmissionCheckFailed, execute_connected_order
 from packages.execution.engine import ExecutionBlocked, SubmissionUncertain
 from packages.execution.order_state import BrokerFillState, broker_fill_state
 from packages.security.credentials import CredentialCipher
@@ -187,6 +187,19 @@ def _open_fill_response_is_valid(order: BrokerOrder) -> bool:
     return True
 
 
+def _opening_clock_allows_submission(clock: ConnectedMarketClock | None) -> bool:
+    """Only the connected broker clock can authorize current-session opening."""
+    return clock is not None and clock.is_open
+
+
+def _opening_market_clock_failure_reason(clock: ConnectedMarketClock | None) -> str | None:
+    if clock is None:
+        return "authoritative_market_clock_unavailable"
+    if not clock.is_open:
+        return "market_session_closed"
+    return None
+
+
 async def process_workspace_approvals(
     *, database: Database, cipher: CredentialCipher, workspace_id: UUID, now: datetime
 ) -> None:
@@ -195,12 +208,10 @@ async def process_workspace_approvals(
     await store.reclaim_stale_revalidating(workspace_id=workspace_id, now=now)
     await _recover_ready_to_submit(database, store, cipher, workspace_id)
     await store.expire_before(workspace_id=workspace_id, now=now)
-    session_date = now.astimezone(ZoneInfo("America/New_York")).date()
     while True:
         now = datetime.now(UTC)
-        session_date = now.astimezone(ZoneInfo("America/New_York")).date()
         approval_record = await store.claim_next(
-            workspace_id=workspace_id, session_date=session_date, now=now
+            workspace_id=workspace_id, now=now
         )
         if approval_record is None:
             return
@@ -225,6 +236,7 @@ async def process_workspace_approvals(
             )
 
         submission_started = False
+        submission_token: UUID | None = None
         try:
             if approval_record.opportunity_id is None:
                 await _finish(
@@ -361,7 +373,6 @@ async def process_workspace_approvals(
                 )
                 continue
             now = datetime.now(UTC)
-            session_date = now.astimezone(ZoneInfo("America/New_York")).date()
             approval = ConditionalApproval(
                 approval_id=approval_record.approval_id,
                 workspace_id=approval_record.workspace_id,
@@ -401,7 +412,7 @@ async def process_workspace_approvals(
             result = revalidate_for_submission(
                 approval,
                 now=now,
-                session_date=session_date,
+                session_date=approval_record.session_date,
                 structure_fingerprint=order_structure_fingerprint(fresh_intent),
                 limit_price=fresh_intent.limit_price,
                 maximum_loss=fresh_candidate.structure.max_loss,
@@ -421,15 +432,29 @@ async def process_workspace_approvals(
                 )
                 continue
             now = datetime.now(UTC)
-            submission_token = (
-                None
-                if claim_token is None
-                else await store.authorize_submission(
+            try:
+                clock = await AlpacaMarketClockAdapter(
+                    str(secret["api_key_id"]),
+                    str(secret["secret_key"]),
+                    environment=environment,
+                ).get_clock()
+            except Exception:
+                clock = None
+            clock_failure_reason = _opening_market_clock_failure_reason(clock)
+            if clock_failure_reason is not None:
+                await store.release_revalidation(
                     approval_record.approval_id,
                     workspace_id=workspace_id,
-                    now=now,
-                    claim_token=claim_token,
+                    claim_token=bound_claim_token,
+                    now=datetime.now(UTC),
+                    reason=clock_failure_reason,
                 )
+                return
+            submission_token = await store.authorize_submission(
+                approval_record.approval_id,
+                workspace_id=workspace_id,
+                now=now,
+                claim_token=claim_token,
             )
             if submission_token is None:
                 continue
@@ -483,6 +508,26 @@ async def process_workspace_approvals(
                 ),
                 broker_order_id=broker_order.broker_order_id,
                 broker_order=broker_order,
+            )
+        except PreSubmissionCheckFailed as error:
+            if submission_token is not None and str(error) in {
+                "authoritative_market_clock_unavailable",
+                "market_session_closed",
+            }:
+                await store.release_submission(
+                    approval_record.approval_id,
+                    workspace_id=workspace_id,
+                    claim_token=bound_claim_token,
+                    submission_token=submission_token,
+                    now=datetime.now(UTC),
+                    reason=str(error),
+                )
+                return
+            await _finish(
+                approval_record.approval_id,
+                state=ApprovalState.CONDITION_FAILED,
+                now=datetime.now(UTC),
+                reason=str(error),
             )
         except SubmissionUncertain as error:
             await _finish(

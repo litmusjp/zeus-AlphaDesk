@@ -476,12 +476,6 @@ async def _scanner_supervisor(
             for workspace in workspaces:
                 if not await _alpaca_market_is_open(credential_store, workspace.workspace_id):
                     continue
-                await process_workspace_approvals(
-                    database=database,
-                    cipher=cipher,
-                    workspace_id=workspace.workspace_id,
-                    now=now,
-                )
                 await queue_triggered_exit_plans(
                     database=database,
                     cipher=cipher,
@@ -493,6 +487,19 @@ async def _scanner_supervisor(
                     workspace_id=workspace.workspace_id,
                     now=now,
                 )
+        async with database.sessions() as session:
+            approval_workspaces = list(
+                await session.scalars(
+                    select(WorkspaceRecord).where(WorkspaceRecord.status == "ACTIVE")
+                )
+            )
+        for workspace in approval_workspaces:
+            await process_workspace_approvals(
+                database=database,
+                cipher=cipher,
+                workspace_id=workspace.workspace_id,
+                now=now,
+            )
         await _wait_or_stop(stop, 30)
 
 

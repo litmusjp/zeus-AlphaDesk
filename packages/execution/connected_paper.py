@@ -30,6 +30,10 @@ from packages.security.credentials import CredentialCipher
 from packages.security.store import CredentialStore
 
 
+class PreSubmissionCheckFailed(ExecutionBlocked):
+    """A provider-side check failed before the broker submission boundary."""
+
+
 async def execute_connected_paper_order(
     *,
     database: Database,
@@ -270,9 +274,9 @@ async def _execute_connected_order(
             api_key, secret_key, environment=environment
         ).get_clock()
     except Exception as error:
-        raise ExecutionBlocked("Authoritative target market clock unavailable") from error
+        raise PreSubmissionCheckFailed("authoritative_market_clock_unavailable") from error
     if not market_clock.is_open:
-        raise ExecutionBlocked("Market session is closed")
+        raise PreSubmissionCheckFailed("market_session_closed")
     guardian = PostgresGuardianStore(database.sessions, workspace_id)
     engine = ExecutionEngine(
         adapter,
