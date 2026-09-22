@@ -123,7 +123,7 @@ def _broker_evidence_is_valid(
     if (
         record.approved_broker_account_id is None
         or broker_order.broker_account_id != record.approved_broker_account_id
-        or broker_order.environment != "PAPER"
+        or broker_order.environment != record.execution_environment
     ):
         return False
     if broker_order.asset_class != "us_option":

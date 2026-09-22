@@ -42,14 +42,20 @@ def _open_order_matches(
     *,
     approved_client_order_id: str,
     expected_broker_account_id: str | None = None,
+    expected_environment: TradingEnvironment | str = TradingEnvironment.PAPER,
 ) -> bool:
+    expected_environment_value = (
+        expected_environment.value
+        if isinstance(expected_environment, TradingEnvironment)
+        else expected_environment
+    )
     return (
         bool(order.broker_order_id)
         and (
             expected_broker_account_id is None
             or (
                 order.broker_account_id == expected_broker_account_id
-                and order.environment == "PAPER"
+                and order.environment == expected_environment_value
             )
         )
         and order.client_order_id == approved_client_order_id
@@ -477,6 +483,7 @@ async def process_workspace_approvals(
                 fresh_intent,
                 approved_client_order_id=approval_record.client_order_id,
                 expected_broker_account_id=approval_record.approved_broker_account_id,
+                expected_environment=environment,
             ):
                 await _finish(
                     approval_record.approval_id,
@@ -642,6 +649,7 @@ async def _recover_ready_to_submit(
                 recovered_intent,
                 approved_client_order_id=record.client_order_id,
                 expected_broker_account_id=record.approved_broker_account_id,
+                expected_environment=environment,
             ):
                 await _finish(
                     record.approval_id,

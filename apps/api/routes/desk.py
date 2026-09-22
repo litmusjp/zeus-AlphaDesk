@@ -2025,6 +2025,7 @@ async def approve_position_close_for_next_session(
             record = existing
             record.approved_by_user_id = context.principal.user_id
             record.approved_broker_account_id = snapshot.account.account_id
+            record.execution_environment = environment.value
             record.state = ApprovalState.APPROVED_FOR_SESSION
             record.approved_at = now
             record.expires_at = expires_at
@@ -2050,6 +2051,7 @@ async def approve_position_close_for_next_session(
                 opportunity_id=None,
                 approved_by_user_id=context.principal.user_id,
                 approved_broker_account_id=snapshot.account.account_id,
+                execution_environment=environment.value,
                 state=ApprovalState.APPROVED_FOR_SESSION,
                 approval_kind="CLOSE",
                 session_date=session_date,

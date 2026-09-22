@@ -6,6 +6,8 @@ import pytest
 
 from packages.database.models import ConditionalApprovalRecord
 from packages.domain.broker import BrokerOrder, BrokerOrderLeg
+from packages.domain.system import TradingEnvironment
+from packages.domain.workflow import IntentLeg, OrderIntent, stable_client_order_id
 from packages.execution.conditional_approval import (
     ApprovalState,
     ConditionalApproval,
@@ -20,7 +22,7 @@ from packages.execution.conditional_approval import (
     revalidate_for_submission,
     validate_exit_plan,
 )
-from packages.execution.conditional_runner import _open_fill_response_is_valid
+from packages.execution.conditional_runner import _open_fill_response_is_valid, _open_order_matches
 from packages.execution.conditional_store import (
     _broker_evidence_is_valid,
     _finish_transition_allowed,
@@ -45,6 +47,56 @@ def approval(**overrides: object) -> ConditionalApproval:
     }
     values.update(overrides)
     return ConditionalApproval(**values)
+
+
+def test_open_order_match_accepts_the_bound_live_environment() -> None:
+    risk_decision_id = uuid4()
+    legs = (IntentLeg(symbol="AAPL", side="buy", ratio=1),)
+    intent = OrderIntent(
+        order_intent_id=uuid4(),
+        client_order_id=stable_client_order_id(
+            risk_decision_id, legs, 1, Decimal("2.08"), "day", "LIMIT"
+        ),
+        risk_decision_id=risk_decision_id,
+        legs=legs,
+        quantity=1,
+        limit_price=Decimal("2.08"),
+        execution_policy="LIMIT",
+        created_at=datetime(2026, 9, 22, 14, tzinfo=UTC),
+    )
+    order = BrokerOrder(
+        broker_order_id="broker-1",
+        client_order_id=intent.client_order_id,
+        status="new",
+        asset_class="us_option",
+        order_type="limit",
+        order_class="mleg",
+        time_in_force="day",
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("0"),
+        limit_price=Decimal("2.08"),
+        created_at=datetime(2026, 9, 22, 14, tzinfo=UTC),
+        broker_account_id="live-account",
+        environment=TradingEnvironment.LIVE.value,
+        legs=(
+            BrokerOrderLeg(
+                broker_order_id="broker-1",
+                symbol="AAPL",
+                side="buy",
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0"),
+                status="new",
+            ),
+        ),
+    )
+
+    assert _open_order_matches(
+        order,
+        intent,
+        approved_client_order_id=intent.client_order_id,
+        expected_broker_account_id="live-account",
+        expected_environment=TradingEnvironment.LIVE,
+    )
 
 
 def test_revalidation_allows_one_approved_session_submission() -> None:
@@ -346,6 +398,7 @@ def broker_record(**overrides: object) -> ConditionalApprovalRecord:
         "approved_intent_payload": {"quantity": 1, "limit_price": "4.50"},
         "approved_structure_identity": {"legs": []},
         "approved_broker_account_id": "paper-account-1",
+        "execution_environment": TradingEnvironment.PAPER.value,
         "max_limit_price": Decimal("4.50"),
         "max_loss": Decimal("450"),
         "max_quantity": 1,
@@ -421,6 +474,19 @@ def test_open_and_store_evidence_accept_distinct_parent_and_leg_broker_order_ids
 
     assert _open_fill_response_is_valid(order)
     assert _broker_evidence_is_valid(broker_record(), ApprovalState.SUBMITTED, order)
+
+
+def test_store_evidence_accepts_the_bound_live_environment() -> None:
+    record = broker_record(
+        execution_environment=TradingEnvironment.LIVE.value,
+        approved_broker_account_id="live-account-1",
+    )
+    order = broker_order(
+        broker_account_id="live-account-1",
+        environment=TradingEnvironment.LIVE.value,
+    )
+
+    assert _broker_evidence_is_valid(record, ApprovalState.SUBMITTED, order)
 
 
 @pytest.mark.parametrize("leg_broker_order_id", ["", None])

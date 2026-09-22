@@ -136,6 +136,7 @@ async def queue_triggered_exit_plans(
                         opportunity_id=None,
                         approved_by_user_id=opening.approved_by_user_id,
                         approved_broker_account_id=snapshot.account.account_id,
+                        execution_environment=environment.value,
                         state=ApprovalState.APPROVED_FOR_SESSION,
                         approval_kind="CLOSE",
                         session_date=session_date,
