@@ -1,13 +1,18 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 
+from packages.connected.market_clock import ConnectedMarketClock
+from packages.connected.opportunities import ConnectedAnalysis
 from packages.database.models import ConditionalApprovalRecord
 from packages.domain.broker import BrokerOrder, BrokerOrderLeg
 from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import IntentLeg, OrderIntent, stable_client_order_id
+from packages.execution import conditional_runner
 from packages.execution.conditional_approval import (
     ApprovalState,
     ConditionalApproval,
@@ -418,6 +423,101 @@ def broker_record(**overrides: object) -> ConditionalApprovalRecord:
     }
     values.update(overrides)
     return ConditionalApprovalRecord(**values)
+
+
+@pytest.mark.parametrize("clock_status", ["closed", "unavailable", "error"])
+async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
+    monkeypatch: pytest.MonkeyPatch, clock_status: str
+) -> None:
+    now = datetime.now(UTC)
+    risk_id = uuid4()
+    legs = (IntentLeg(symbol="AAPL261016C00200000", side="buy", ratio=1),)
+    intent = OrderIntent(
+        order_intent_id=uuid4(),
+        client_order_id=stable_client_order_id(
+            risk_id, legs, 1, Decimal("2.08"), "day", "LIMIT"
+        ),
+        risk_decision_id=risk_id,
+        legs=legs,
+        quantity=1,
+        limit_price=Decimal("2.08"),
+        execution_policy="LIMIT",
+        created_at=now,
+    )
+    record = broker_record(
+        approved_intent_payload=intent.model_dump(mode="json"),
+        client_order_id=intent.client_order_id,
+        expires_at=now + timedelta(days=1),
+        exit_plan_payload=valid_exit_plan(),
+    )
+    original = ConnectedAnalysis(
+        opportunity_id=record.opportunity_id,
+        symbol="AAPL",
+        disposition="TRADE",
+        observed_at=now,
+        expires_at=now + timedelta(days=1),
+        signal={},
+    )
+    session = AsyncMock()
+    session.scalar.side_effect = [
+        SimpleNamespace(payload=original.model_dump(mode="json")),
+        SimpleNamespace(trading_environment="PAPER", assessment_policy={}),
+    ]
+    database = MagicMock()
+    database.sessions.return_value.__aenter__.return_value = session
+    store = AsyncMock()
+    store.claim_next.side_effect = [record, None]
+    monkeypatch.setattr(conditional_runner, "ConditionalApprovalStore", lambda _: store)
+    monkeypatch.setattr(conditional_runner, "_recover_ready_to_submit", AsyncMock())
+    credentials = MagicMock()
+    credentials.return_value.reveal = AsyncMock(
+        return_value={"api_key_id": "test-key", "secret_key": "test-secret"}
+    )
+    monkeypatch.setattr(conditional_runner, "CredentialStore", credentials)
+    service = MagicMock()
+    service.return_value.analyze = AsyncMock(
+        return_value=original.model_copy(update={"disposition": "NO_TRADE"})
+    )
+    monkeypatch.setattr(conditional_runner, "ConnectedOpportunityService", service)
+    clock = ConnectedMarketClock(
+        is_open=False,
+        timestamp=now,
+        next_open=now + timedelta(days=1),
+        next_close=now + timedelta(days=1, hours=6),
+    )
+    adapter = MagicMock()
+    adapter.return_value.get_clock = AsyncMock(
+        return_value=clock if clock_status == "closed" else None,
+        side_effect=RuntimeError("clock unavailable") if clock_status == "error" else None,
+    )
+    monkeypatch.setattr(conditional_runner, "AlpacaMarketClockAdapter", adapter)
+    execute = AsyncMock()
+    monkeypatch.setattr(conditional_runner, "execute_connected_order", execute)
+
+    await conditional_runner.process_workspace_approvals(
+        database=database, cipher=MagicMock(), workspace_id=record.workspace_id, now=now
+    )
+
+    service.return_value.analyze.assert_not_awaited()
+    adapter.assert_called_once_with(
+        "test-key", "test-secret", environment=TradingEnvironment.PAPER
+    )
+    adapter.return_value.get_clock.assert_awaited_once_with()
+    store.release_revalidation.assert_awaited_once_with(
+        record.approval_id,
+        workspace_id=record.workspace_id,
+        claim_token=record.claim_token,
+        now=ANY,
+        reason=(
+            "market_session_closed"
+            if clock_status == "closed"
+            else "authoritative_market_clock_unavailable"
+        ),
+    )
+    store.finish.assert_not_awaited()
+    store.authorize_submission.assert_not_awaited()
+    execute.assert_not_awaited()
+    store.claim_next.assert_awaited_once()
 
 
 def broker_order(**overrides: object) -> BrokerOrder:

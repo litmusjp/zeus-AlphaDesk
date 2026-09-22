@@ -316,6 +316,25 @@ async def process_workspace_approvals(
                     reason="alpaca_credential_unavailable",
                 )
                 continue
+            # Defer before execution analysis can reject unavailable off-session quotes.
+            try:
+                clock = await AlpacaMarketClockAdapter(
+                    str(secret["api_key_id"]),
+                    str(secret["secret_key"]),
+                    environment=environment,
+                ).get_clock()
+            except Exception:
+                clock = None
+            clock_failure_reason = _opening_market_clock_failure_reason(clock)
+            if clock_failure_reason is not None:
+                await store.release_revalidation(
+                    approval_record.approval_id,
+                    workspace_id=workspace_id,
+                    claim_token=bound_claim_token,
+                    now=datetime.now(UTC),
+                    reason=clock_failure_reason,
+                )
+                return
             service = ConnectedOpportunityService(
                 database.sessions,
                 workspace_id,
