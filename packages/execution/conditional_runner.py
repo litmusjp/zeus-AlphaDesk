@@ -13,7 +13,6 @@ from packages.broker.validation import validate_broker_order_leg_identity
 from packages.connected.assessment_policy import AssessmentPolicy
 from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
-from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import ConnectedOpportunityRecord, WorkspaceRecord
 from packages.database.session import Database
 from packages.domain.broker import BrokerOrder
@@ -26,14 +25,17 @@ from packages.execution.conditional_approval import (
     candidate_structure_identity,
     order_structure_fingerprint,
     revalidate_for_submission,
-    validate_exit_plan,
+    validate_exit_plan_binding,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.execution.connected_paper import PreSubmissionCheckFailed, execute_connected_order
 from packages.execution.engine import ExecutionBlocked, SubmissionUncertain
 from packages.execution.order_state import BrokerFillState, broker_fill_state
+from packages.observability.logging import get_logger
 from packages.security.credentials import CredentialCipher
 from packages.security.store import CredentialStore
+
+logger = get_logger(__name__)
 
 
 def _open_order_matches(
@@ -216,9 +218,7 @@ async def process_workspace_approvals(
     await store.expire_before(workspace_id=workspace_id, now=now)
     while True:
         now = datetime.now(UTC)
-        approval_record = await store.claim_next(
-            workspace_id=workspace_id, now=now
-        )
+        approval_record = await store.claim_next(workspace_id=workspace_id, now=now)
         if approval_record is None:
             return
         claim_token = approval_record.claim_token
@@ -230,10 +230,45 @@ async def process_workspace_approvals(
             )
             continue
         bound_claim_token = claim_token
+        bound_approval_id = approval_record.approval_id
+        gate_context = {"stage": "approval_snapshot"}
+
+        def diagnose(
+            reason: str,
+            *,
+            retryable: bool = False,
+            _approval_id: UUID = bound_approval_id,
+            _context: dict[str, str] = gate_context,
+        ) -> None:
+            logger.info(
+                "conditional_approval_revalidation",
+                extra={
+                    "event": "conditional_approval_revalidation",
+                    "approval_id": str(_approval_id),
+                    "stage": _context["stage"],
+                    "reason_code": reason,
+                    "retryable": retryable,
+                },
+            )
+
+        async def _release(
+            reason: str,
+            _approval_id: UUID = bound_approval_id,
+            _claim_token: UUID = bound_claim_token,
+        ) -> None:
+            diagnose(reason, retryable=True)
+            await store.release_revalidation(
+                _approval_id,
+                workspace_id=workspace_id,
+                claim_token=_claim_token,
+                now=datetime.now(UTC),
+                reason=reason,
+            )
 
         async def _finish(
             approval_id: UUID, _claim_token: UUID = bound_claim_token, **kwargs: Any
         ) -> None:
+            diagnose(kwargs.get("reason") or str(kwargs["state"]))
             await store.finish(
                 approval_id,
                 workspace_id=workspace_id,
@@ -260,9 +295,7 @@ async def process_workspace_approvals(
                     )
                 )
                 workspace = await session.scalar(
-                    select(WorkspaceRecord).where(
-                        WorkspaceRecord.workspace_id == workspace_id
-                    )
+                    select(WorkspaceRecord).where(WorkspaceRecord.workspace_id == workspace_id)
                 )
             if original_record is None:
                 await _finish(
@@ -284,15 +317,6 @@ async def process_workspace_approvals(
                     reason="approved_snapshot_missing",
                 )
                 continue
-            invalid_exit_plan = validate_exit_plan(approval_record.exit_plan_payload)
-            if invalid_exit_plan:
-                await _finish(
-                    approval_record.approval_id,
-                    state=ApprovalState.CONDITION_FAILED,
-                    now=now,
-                    reason=invalid_exit_plan,
-                )
-                continue
             approved_intent = OrderIntent.model_validate(approval_record.approved_intent_payload)
             if workspace is None:
                 await _finish(
@@ -305,9 +329,7 @@ async def process_workspace_approvals(
             environment = TradingEnvironment(workspace.trading_environment)
             provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
             workspace_policy = workspace.assessment_policy
-            secret = await CredentialStore(database.sessions, cipher).reveal(
-                workspace_id, provider
-            )
+            secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
             if secret is None:
                 await _finish(
                     approval_record.approval_id,
@@ -316,7 +338,8 @@ async def process_workspace_approvals(
                     reason="alpaca_credential_unavailable",
                 )
                 continue
-            # Defer before execution analysis can reject unavailable off-session quotes.
+            gate_context["stage"] = "initial_market_clock"
+            # Defer before refreshing unavailable off-session quotes.
             try:
                 clock = await AlpacaMarketClockAdapter(
                     str(secret["api_key_id"]),
@@ -327,14 +350,23 @@ async def process_workspace_approvals(
                 clock = None
             clock_failure_reason = _opening_market_clock_failure_reason(clock)
             if clock_failure_reason is not None:
-                await store.release_revalidation(
-                    approval_record.approval_id,
-                    workspace_id=workspace_id,
-                    claim_token=bound_claim_token,
-                    now=datetime.now(UTC),
-                    reason=clock_failure_reason,
-                )
+                await _release(clock_failure_reason)
                 return
+            invalid_exit_plan = validate_exit_plan_binding(
+                approval_record.exit_plan_payload,
+                opening_approval_id=approval_record.approval_id,
+                structure_fingerprint=approval_record.structure_fingerprint,
+                broker_account_id=approval_record.approved_broker_account_id or "",
+                environment=environment.value,
+            )
+            if invalid_exit_plan:
+                await _finish(
+                    approval_record.approval_id,
+                    state=ApprovalState.CONDITION_FAILED,
+                    now=now,
+                    reason=invalid_exit_plan,
+                )
+                continue
             service = ConnectedOpportunityService(
                 database.sessions,
                 workspace_id,
@@ -343,23 +375,38 @@ async def process_workspace_approvals(
                 policy=AssessmentPolicy.from_payload(workspace_policy or {}),
                 environment=environment,
             )
-            fresh = await service.analyze(
-                original.symbol,
-                mode=ScanMode.EXECUTION,
+            gate_context["stage"] = "approved_refresh"
+            fresh = await service.refresh_approved(
+                original,
                 approved_intent=approved_intent,
+                approved_broker_account_id=approval_record.approved_broker_account_id,
+                expected_environment=environment,
+            )
+            diagnostics = fresh.option_diagnostics or {}
+            gate_context["stage"] = str(diagnostics.get("stage", "approved_refresh"))
+            diagnose(
+                fresh.reason_codes[0] if fresh.reason_codes else "refresh_completed",
+                retryable=diagnostics.get("retryable") is True,
             )
             if (
                 fresh.disposition != "TRADE"
                 or fresh.order_intent is None
                 or fresh.candidate is None
             ):
+                reason = (
+                    fresh.reason_codes[0] if fresh.reason_codes else "approved_refresh_rejected"
+                )
+                if diagnostics.get("retryable") is True:
+                    await _release(reason)
+                    return
                 await _finish(
                     approval_record.approval_id,
                     state=ApprovalState.CONDITION_FAILED,
                     now=now,
-                    reason=f"fresh_disposition_{fresh.disposition.lower()}",
+                    reason=reason,
                 )
                 continue
+            gate_context["stage"] = "approval_identity"
             fresh_intent = OrderIntent.model_validate(fresh.order_intent)
             fresh_candidate = RankedCandidate.model_validate(fresh.candidate)
             if not _intent_matches_approved(fresh_intent, approved_intent):
@@ -422,6 +469,7 @@ async def process_workspace_approvals(
                     reason="quote_timestamp_in_future",
                 )
                 continue
+            gate_context["stage"] = "quote_age"
             leg_quote_times = tuple(
                 leg.contract.quote.quoted_at for leg in fresh_candidate.structure.legs
             )
@@ -434,6 +482,7 @@ async def process_workspace_approvals(
                 )
                 continue
             quote_age_seconds = max(0, ceil((now - min(leg_quote_times)).total_seconds()))
+            gate_context["stage"] = "approval_bounds"
             result = revalidate_for_submission(
                 approval,
                 now=now,
@@ -445,6 +494,9 @@ async def process_workspace_approvals(
                 quote_age_seconds=quote_age_seconds,
             )
             if result.decision is not RevalidationDecision.READY_TO_SUBMIT:
+                if result.reason == "quote_stale":
+                    await _release(result.reason)
+                    return
                 await _finish(
                     approval_record.approval_id,
                     state=(
@@ -457,6 +509,7 @@ async def process_workspace_approvals(
                 )
                 continue
             now = datetime.now(UTC)
+            gate_context["stage"] = "final_market_clock"
             try:
                 clock = await AlpacaMarketClockAdapter(
                     str(secret["api_key_id"]),
@@ -467,14 +520,9 @@ async def process_workspace_approvals(
                 clock = None
             clock_failure_reason = _opening_market_clock_failure_reason(clock)
             if clock_failure_reason is not None:
-                await store.release_revalidation(
-                    approval_record.approval_id,
-                    workspace_id=workspace_id,
-                    claim_token=bound_claim_token,
-                    now=datetime.now(UTC),
-                    reason=clock_failure_reason,
-                )
+                await _release(clock_failure_reason)
                 return
+            gate_context["stage"] = "submission_authorization"
             submission_token = await store.authorize_submission(
                 approval_record.approval_id,
                 workspace_id=workspace_id,
@@ -484,6 +532,7 @@ async def process_workspace_approvals(
             if submission_token is None:
                 continue
             submission_started = True
+            gate_context["stage"] = "final_execution_gates"
             broker_order = await execute_connected_order(
                 database=database,
                 cipher=cipher,
@@ -497,6 +546,7 @@ async def process_workspace_approvals(
                 submission_token=submission_token,
                 environment=environment,
             )
+            gate_context["stage"] = "broker_response"
             if not _open_order_matches(
                 broker_order,
                 fresh_intent,
@@ -540,6 +590,7 @@ async def process_workspace_approvals(
                 "authoritative_market_clock_unavailable",
                 "market_session_closed",
             }:
+                diagnose(str(error), retryable=True)
                 await store.release_submission(
                     approval_record.approval_id,
                     workspace_id=workspace_id,
@@ -563,11 +614,30 @@ async def process_workspace_approvals(
                 reason=str(error),
             )
         except ExecutionBlocked as error:
+            retryable_reasons = {
+                "Broker account projection unavailable": "broker_account_unavailable",
+                "Authenticated target account unavailable": "broker_account_unavailable",
+                "Broker reconciliation is stale.": "broker_reconciliation_stale",
+                "Reconciliation timestamp is unknown.": "broker_reconciliation_unavailable",
+                "Alpaca trade_updates stream is not connected.": "broker_stream_unavailable",
+            }
+            retry_reason = retryable_reasons.get(str(error))
+            if submission_token is not None and retry_reason is not None:
+                diagnose(retry_reason, retryable=True)
+                await store.release_submission(
+                    approval_record.approval_id,
+                    workspace_id=workspace_id,
+                    claim_token=bound_claim_token,
+                    submission_token=submission_token,
+                    now=datetime.now(UTC),
+                    reason=retry_reason,
+                )
+                return
             await _finish(
                 approval_record.approval_id,
                 state=ApprovalState.CONDITION_FAILED,
                 now=now,
-                reason=type(error).__name__,
+                reason="final_execution_gate_rejected",
             )
         except Exception as error:
             await _finish(

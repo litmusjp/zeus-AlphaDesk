@@ -23,6 +23,8 @@ from packages.domain.options import LegSide, OptionLeg, OptionType, StructureTyp
 from packages.domain.system import TradingEnvironment
 from packages.domain.workflow import CatalystFeatures, NoTrade, OrderIntent, RankedCandidate, Signal
 from packages.execution.intents import create_order_intent
+from packages.guardian.gate import GuardianExecutionGate
+from packages.guardian.store import PostgresGuardianStore
 from packages.options.alpaca_adapter import (
     AlpacaOptionChainAdapter,
     OptionChainQuery,
@@ -246,6 +248,244 @@ class ConnectedOpportunityService:
         )
         return features, price, now
 
+    async def refresh_approved(
+        self,
+        original: ConnectedAnalysis,
+        *,
+        approved_intent: OrderIntent,
+        approved_broker_account_id: str | None = None,
+        expected_environment: TradingEnvironment | None = None,
+    ) -> ConnectedAnalysis:
+        """Revalidate an immutable approval, without signal scoring or leg selection."""
+        now = datetime.now(UTC)
+
+        async def result(
+            stage: str,
+            reasons: tuple[str, ...],
+            *,
+            retryable: bool = False,
+            candidate: RankedCandidate | None = None,
+        ) -> ConnectedAnalysis:
+            refreshed = ConnectedAnalysis(
+                opportunity_id=uuid4(),
+                symbol=original.symbol,
+                disposition="TRADE" if candidate is not None else "UNAVAILABLE",
+                observed_at=now,
+                expires_at=now + timedelta(minutes=2),
+                signal=original.signal,
+                trade_idea=original.trade_idea,
+                candidate=None if candidate is None else candidate.model_dump(mode="json"),
+                order_intent=(
+                    None if candidate is None else approved_intent.model_dump(mode="json")
+                ),
+                reason_codes=reasons,
+                option_diagnostics={
+                    "stage": stage,
+                    "reason": reasons[0],
+                    "retryable": retryable,
+                    "approved_opportunity_id": str(original.opportunity_id),
+                },
+            )
+            await self._persist(refreshed)
+            return refreshed
+
+        if original.candidate is None:
+            return await result("identity", ("approved_candidate_missing",))
+        candidate = RankedCandidate.model_validate(original.candidate)
+        structure = candidate.structure
+        legs = structure.legs
+        if (
+            structure.quantity != approved_intent.quantity
+            or tuple(
+                (leg.contract.symbol, "buy" if leg.side is LegSide.LONG else "sell", leg.ratio)
+                for leg in legs
+            )
+            != tuple((leg.symbol, leg.side, leg.ratio) for leg in approved_intent.legs)
+            or any(leg.contract.underlying_symbol != original.symbol for leg in legs)
+        ):
+            return await result("identity", ("approved_structure_changed",))
+        # Connected approvals support the debit verticals produced by this service only.
+        if (
+            structure.structure_type
+            not in {
+                StructureType.BULL_CALL_DEBIT_SPREAD,
+                StructureType.BEAR_PUT_DEBIT_SPREAD,
+            }
+            or structure.underlying is not None
+        ):
+            return await result("identity", ("approved_structure_unsupported",))
+        if any(
+            not self._policy.minimum_dte
+            <= (leg.contract.expiration - now.date()).days
+            <= self._policy.maximum_dte
+            for leg in legs
+        ):
+            return await result("expiry", ("dte_out_of_range",))
+        try:
+            contracts, _ = await self._options.get_chain_with_diagnostics(
+                OptionChainQuery(
+                    underlying_symbol=original.symbol,
+                    expiration_date_gte=min(leg.contract.expiration for leg in legs),
+                    expiration_date_lte=max(leg.contract.expiration for leg in legs),
+                    strike_price_gte=min(leg.contract.strike for leg in legs),
+                    strike_price_lte=max(leg.contract.strike for leg in legs),
+                )
+            )
+        except Exception:
+            return await result("quotes", ("option_data_unavailable",), retryable=True)
+        refreshed_legs: list[OptionLeg] = []
+        for leg in legs:
+            matches = [item for item in contracts if item.symbol == leg.contract.symbol]
+            if not matches:
+                return await result(
+                    "quotes", ("approved_contract_data_unavailable",), retryable=True
+                )
+            if len(matches) != 1 or matches[0].model_dump(exclude={"quote", "tradable"}) != (
+                leg.contract.model_dump(exclude={"quote", "tradable"})
+            ):
+                return await result("identity", ("approved_contract_identity_changed",))
+            refreshed_legs.append(leg.model_copy(update={"contract": matches[0]}))
+        try:
+            snapshots = await asyncio.to_thread(
+                self._stock.get_stock_snapshot,
+                StockSnapshotRequest(symbol_or_symbols=original.symbol, feed=DataFeed.IEX),
+            )
+            trade = snapshots[original.symbol].latest_trade
+            if trade is None:
+                return await result("quotes", ("underlying_quote_unavailable",), retryable=True)
+            underlying_price = _decimal(trade.price)
+            age = (datetime.now(UTC) - trade.timestamp).total_seconds()
+            if not 0 <= age <= self._policy.execution_max_quote_age_seconds:
+                return await result("quotes", ("underlying_quote_stale",), retryable=True)
+        except Exception:
+            return await result("quotes", ("underlying_quote_unavailable",), retryable=True)
+        reasons: set[str] = set()
+        for leg in refreshed_legs:
+            selection = select_contracts(
+                (leg.contract,),
+                underlying_price=underlying_price,
+                wanted_type=leg.contract.option_type,
+                as_of=datetime.now(UTC),
+                mode=ScanMode.EXECUTION,
+                policy=self._policy,
+            )
+            reasons.update(selection.diagnostics.rejection_counts)
+        if reasons:
+            temporary = {
+                "stale_quote",
+                "non_executable_quote",
+                "spread_too_wide",
+                "quote_size_too_small",
+                "open_interest_unavailable",
+                "greeks_unavailable",
+            }
+            return await result("quotes", tuple(sorted(reasons)), retryable=reasons <= temporary)
+        executable_debit = sum(
+            (
+                leg.side.sign
+                * leg.ratio
+                * (leg.contract.quote.ask if leg.side is LegSide.LONG else leg.contract.quote.bid)
+                for leg in refreshed_legs
+            ),
+            Decimal("0"),
+        )
+        if executable_debit <= 0 or executable_debit > approved_intent.limit_price:
+            return await result("price", ("approved_limit_price_exceeded",))
+        # Rebuild Greeks from fresh snapshots, and loss at the immutable approved price.
+        # A better current quote must not understate the loss of the submitted limit order.
+        price_delta = approved_intent.limit_price - structure.net_premium_per_share
+        first_long = next(i for i, leg in enumerate(refreshed_legs) if leg.side is LegSide.LONG)
+        long_leg = refreshed_legs[first_long]
+        refreshed_legs[first_long] = long_leg.model_copy(
+            update={
+                "entry_price": long_leg.entry_price + price_delta / long_leg.ratio,
+            }
+        )
+        try:
+            refreshed_structure = build_structure(
+                structure.structure_type,
+                tuple(refreshed_legs),
+                quantity=approved_intent.quantity,
+            )
+        except ValueError:
+            return await result("structure", ("invalid_approved_structure",))
+        candidate = candidate.model_copy(update={"structure": refreshed_structure})
+        sizing_error = self._policy.order_sizing_error(
+            quantity=approved_intent.quantity,
+            max_loss=refreshed_structure.max_loss,
+        )
+        if sizing_error is not None:
+            return await result("risk", ("order_sizing_rejected",))
+        projections = PostgresBrokerProjectionStore(
+            self._sessions, self._workspace_id, self._environment
+        )
+        try:
+            account = await projections.get_account()
+            positions = await projections.list_positions()
+            gate = await BrokerExecutionGate(projections, environment=self._environment).evaluate()
+        except Exception:
+            return await result("broker", ("broker_readiness_unavailable",), retryable=True)
+        if account is None:
+            return await result("broker", ("broker_account_unavailable",), retryable=True)
+        if expected_environment is not None and (
+            getattr(account, "environment", None) != expected_environment.value
+        ):
+            return await result("broker", ("broker_environment_changed",))
+        if approved_broker_account_id is not None and (
+            getattr(account, "account_id", None) != approved_broker_account_id
+        ):
+            return await result("broker", ("broker_account_changed",))
+        open_loss, underlying_risk, greeks_available = position_exposure(
+            positions, original.symbol, account.equity
+        )
+        risk = RiskEngine(self._policy.as_risk_policy()).evaluate(
+            candidate,
+            RiskContext(
+                paper_equity=account.equity,
+                open_planned_loss=open_loss,
+                underlying_open_risk=underlying_risk,
+                daily_loss=max(account.last_equity - account.equity, Decimal("0")),
+                drawdown_percent=max(account.last_equity - account.equity, Decimal("0"))
+                / max(account.last_equity, Decimal("1"))
+                * Decimal("100"),
+                concurrent_option_structures=sum(
+                    1 for position in positions if position.asset_class.lower() == "us_option"
+                ),
+                broker_execution_allowed=gate.allowed,
+                portfolio_greeks_available=greeks_available,
+            ),
+        )
+        failed_risk = tuple(
+            check.name for check in risk.checks if not check.passed and check.name != "broker_state"
+        )
+        if failed_risk:
+            retryable_risk = set(failed_risk) <= {"greeks"}
+            return await result("risk", ("risk_rejected", *failed_risk), retryable=retryable_risk)
+        try:
+            guardian_allowed, _ = await GuardianExecutionGate(
+                PostgresGuardianStore(self._sessions, self._workspace_id)
+            ).execution_allowed()
+        except Exception:
+            return await result("guardian", ("guardian_unavailable",), retryable=True)
+        if not guardian_allowed:
+            return await result("guardian", ("guardian_rejected",))
+        if not gate.allowed:
+            # Explicit account/identity failures are never treated as a temporary outage.
+            terminal = gate.reason in {
+                "Alpaca account is blocked or suspended.",
+                "Broker projection identity is unavailable or mismatched.",
+            }
+            return await result(
+                "broker",
+                (
+                    "broker_identity_or_account_rejected"
+                    if terminal
+                    else "broker_readiness_unavailable",
+                ),
+                retryable=not terminal,
+            )
+        return await result("approved_refresh", ("ready",), candidate=candidate)
+
     async def analyze(
         self,
         symbol: str,
@@ -424,9 +664,7 @@ class ConnectedOpportunityService:
             self._sessions, self._workspace_id, self._environment
         )
         account = await projections.get_account()
-        gate = await BrokerExecutionGate(
-            projections, environment=self._environment
-        ).evaluate(now)
+        gate = await BrokerExecutionGate(projections, environment=self._environment).evaluate(now)
         if account is None:
             return await self._unavailable(
                 opportunity_id,

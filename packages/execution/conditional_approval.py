@@ -86,6 +86,30 @@ def validate_exit_plan(plan: object) -> str | None:
     return None
 
 
+def validate_exit_plan_binding(
+    plan: object,
+    *,
+    opening_approval_id: UUID,
+    structure_fingerprint: str,
+    broker_account_id: str,
+    environment: str,
+) -> str | None:
+    """Validate the immutable exit-plan bindings for an opening approval."""
+    invalid = validate_exit_plan(plan)
+    if invalid:
+        return invalid
+    assert isinstance(plan, dict)
+    if str(plan["opening_approval_id"]) != str(opening_approval_id):
+        return "exit_plan_binding_mismatch"
+    if plan["structure_fingerprint"] != structure_fingerprint:
+        return "exit_plan_binding_mismatch"
+    if plan["broker_account_id"] != broker_account_id:
+        return "exit_plan_binding_mismatch"
+    if plan["environment"] != environment:
+        return "exit_plan_binding_mismatch"
+    return None
+
+
 def evaluate_exit_plan(
     plan: object,
     *,
