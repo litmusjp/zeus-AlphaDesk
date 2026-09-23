@@ -508,6 +508,55 @@ class ConditionalApprovalStore:
                 )
             )
 
+    async def release_pre_submission(
+        self,
+        approval_id: UUID,
+        *,
+        workspace_id: UUID,
+        claim_token: UUID,
+        now: datetime,
+        reason: str,
+    ) -> bool:
+        """Return a fenced pre-submission approval to durable pending state.
+
+        The claim token fences both the revalidation and submission phases.  A
+        dispatch-authorized row is deliberately not releasable: it has crossed
+        the provider boundary and must be reconciled instead.
+        """
+        async with self._database.sessions.begin() as session:
+            record = await session.scalar(
+                select(ConditionalApprovalRecord)
+                .where(
+                    ConditionalApprovalRecord.approval_id == approval_id,
+                    ConditionalApprovalRecord.workspace_id == workspace_id,
+                    ConditionalApprovalRecord.claim_token == claim_token,
+                )
+                .with_for_update()
+            )
+            if record is None or record.state not in {
+                ApprovalState.REVALIDATING,
+                ApprovalState.SUBMITTING,
+            }:
+                return False
+            record.state = ApprovalState.APPROVED_FOR_SESSION
+            record.claimed_at = None
+            record.claim_token = None
+            record.submission_claimed_at = None
+            record.submission_token = None
+            record.failure_reason = reason
+            record.updated_at = now
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=workspace_id,
+                    actor_user_id=None,
+                    action="CONDITIONAL_APPROVAL_PRE_SUBMISSION_DEFERRED",
+                    detail={"approval_id": str(approval_id), "reason": reason},
+                    occurred_at=now,
+                )
+            )
+            return True
+
     async def release_submission(
         self,
         approval_id: UUID,

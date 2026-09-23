@@ -42,6 +42,25 @@ class SubmissionAttempted(RuntimeError):
     pass
 
 
+_RETRYABLE_PRE_SUBMISSION_FAILURES = {
+    "authoritative_market_clock_unavailable",
+    "market_session_closed",
+    "initial_broker_check_failed",
+    "option_quote_check_failed",
+    "final_broker_check_failed",
+    "final_option_quote_check_failed",
+    "close_cleanup_failed",
+    "approval_ownership_changed",
+    "alpaca market session is closed",
+}
+
+
+def _is_retryable_pre_submission_failure(reason: str) -> bool:
+    """Return whether a pre-submission provider/readiness failure can be retried."""
+    normalized = reason.strip().lower()
+    return normalized in _RETRYABLE_PRE_SUBMISSION_FAILURES
+
+
 async def queue_triggered_exit_plans(
     *, database: Database, cipher: CredentialCipher, workspace_id: UUID
 ) -> None:
@@ -347,11 +366,29 @@ async def process_workspace_exit_approvals(
                 submission_started=submission_started,
             )
         except PreSubmissionCheckFailed as error:
+            reason = str(error)
+            if _is_retryable_pre_submission_failure(reason):
+                released = await store.release_pre_submission(
+                    record.approval_id,
+                    workspace_id=workspace_id,
+                    claim_token=bound_claim_token,
+                    now=datetime.now(UTC),
+                    reason=reason,
+                )
+                if not released:
+                    await _finish(
+                        record.approval_id,
+                        state=ApprovalState.SUBMISSION_UNCERTAIN,
+                        now=datetime.now(UTC),
+                        reason="dispatch_authorized_requires_reconciliation",
+                    )
+                    continue
+                continue
             await _finish(
                 record.approval_id,
                 state=ApprovalState.CONDITION_FAILED,
                 now=datetime.now(UTC),
-                reason=str(error),
+                reason=reason,
             )
         except SubmissionAttempted as error:
             await _finish(
