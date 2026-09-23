@@ -105,7 +105,7 @@ async def test_unknown_legacy_identity_cannot_open_execution_gate() -> None:
         }
     )
 
-    decision = await BrokerExecutionGate(store).evaluate()
+    decision = await BrokerExecutionGate(store).evaluate(now=NOW)
 
     assert not decision.allowed
     assert "identity" in decision.reason
@@ -137,7 +137,7 @@ async def test_validated_fresh_evidence_can_open_execution_gate() -> None:
         }
     )
 
-    decision = await BrokerExecutionGate(store).evaluate()
+    decision = await BrokerExecutionGate(store).evaluate(now=NOW)
 
     assert decision.allowed
 
