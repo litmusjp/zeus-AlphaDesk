@@ -88,3 +88,385 @@ body .form-message { line-height: 1.55; }
   body .page-content { padding-inline: 16px; }
   body .data-table { max-width: 100%; }
 }
+
+/* Shared refinement layer: keep the paper-desk identity while making dense
+   operator screens easier to scan, read, and use at touch sizes. */
+.workspace-main,
+.workspace-content,
+.control-panel,
+.credential-card,
+.data-table,
+.watchlist-manager,
+.watchlist-research-panel,
+.scanner-toolbar,
+.loading-panel,
+.empty-desk {
+  min-width: 0;
+}
+
+.workspace-content { overflow-wrap: anywhere; }
+.workspace-header { align-items: center; }
+.workspace-header > div:first-child { min-width: 0; }
+.workspace-header h1 { max-width: 26ch; }
+.workspace-header p { max-width: 72ch; }
+.workspace-mode { flex: 0 1 260px; }
+.workspace-mode > span { line-height: 1.35; }
+
+.mode-banner { align-items: flex-start; line-height: 1.5; }
+.mode-banner svg { margin-top: 1px; }
+
+.control-panel,
+.credential-card,
+.data-table,
+.watchlist-manager,
+.watchlist-research-panel,
+.scanner-toolbar,
+.scan-history,
+.state-card {
+  box-shadow: 0 1px 2px rgba(16, 28, 24, .05);
+}
+
+.control-panel h2,
+.control-panel h3,
+.credential-card h2,
+.watchlist-manager h2,
+.watchlist-research-panel h2 { overflow-wrap: anywhere; }
+
+.control-panel p,
+.credential-card p,
+.policy-guide-grid li,
+.form-message { max-width: 78ch; }
+
+.credential-card label,
+.watchlist-form label,
+.invite-form label,
+.confirmation-panel label,
+.policy-editor label { line-height: 1.35; }
+
+.credential-card input,
+.credential-card select,
+.credential-card textarea,
+.watchlist-form input,
+.invite-form input,
+.confirmation-panel input,
+.policy-editor input,
+.policy-editor select,
+.admin-console-section input { min-height: 42px; }
+
+.credential-card input:focus-visible,
+.watchlist-form input:focus-visible,
+.invite-form input:focus-visible,
+.confirmation-panel input:focus-visible,
+.policy-editor input:focus-visible,
+.policy-editor select:focus-visible,
+.admin-console-section input:focus-visible {
+  border-color: var(--desk);
+  box-shadow: 0 0 0 3px rgba(23, 105, 210, .15);
+}
+
+.button-row { align-items: stretch; }
+.button-row > button,
+.watchlist-form button,
+.scanner-toolbar button,
+.invite-form button,
+.admin-provision-button,
+.confirmation-panel > button { min-height: 42px; }
+.icon-button { min-width: 40px; min-height: 40px; }
+
+.data-table { overflow-x: auto; overscroll-behavior-inline: contain; }
+.data-table > header,
+.data-row { overflow-wrap: anywhere; }
+.data-row > strong,
+.data-row > span,
+.data-row > div,
+.data-row > time { min-width: 0; }
+
+.data-row code,
+.masked-record code,
+.confirmation-panel code,
+.form-message code { overflow-wrap: anywhere; word-break: break-word; }
+.review-stats > div { min-width: 0; }
+.review-stats strong { overflow-wrap: anywhere; }
+.review-grid h3 { margin-top: 24px; margin-bottom: 10px; font-size: 12px; letter-spacing: .02em; }
+.check-grid > div strong,
+.status-pill,
+.countdown-pill { font-variant-numeric: tabular-nums; }
+
+.admin-console-sections { gap: 24px; }
+.admin-console-section > h2 { margin-top: 0; letter-spacing: -.01em; }
+.admin-console-section > .control-panel { margin-bottom: 18px; }
+.admin-access-heading p { line-height: 1.5; }
+.policy-intro p,
+.policy-guide-grid p,
+.policy-guide-grid li,
+.policy-editor p { max-width: 82ch; }
+.policy-field small { overflow-wrap: anywhere; }
+.watchlist-research-header > div,
+.watchlist-manager-header > div { min-width: 0; }
+.empty-desk,
+.loading-panel { min-height: 180px; }
+
+@media (max-width: 950px) {
+  .workspace-header { align-items: flex-start; }
+  .workspace-mode { flex-basis: 220px; }
+  .admin-console-section > h2 { font-size: 20px; }
+}
+
+@media (max-width: 680px) {
+  .workspace-header h1 { max-width: none; }
+  .workspace-mode { width: 100%; max-width: none; }
+  .workspace-mode > span { max-width: none; }
+  .mode-banner { padding: 14px; }
+  .control-panel,
+  .credential-card,
+  .watchlist-manager,
+  .watchlist-research-panel { padding: 17px; }
+  .review-stats { grid-template-columns: 1fr 1fr; }
+  .review-stats > div:nth-child(2n) { border-right: 0; }
+  .review-stats > div:nth-last-child(-n + 2) { border-bottom: 0; }
+  .policy-field { grid-template-columns: 1fr; }
+  .watchlist-research-header,
+  .watchlist-manager-header { display: block; }
+  .watchlist-research-header button,
+  .watchlist-manager-header .watchlist-selection-count { margin-top: 12px; }
+  .watchlist-research-header button { width: 100%; justify-content: center; }
+}
+
+/* Targeted consistency pass: keep assessment and admin surfaces inside the
+   existing paper-desk type, control, and panel system. */
+.candidate-assessment-summary {
+  margin-bottom: 14px;
+  padding: 18px;
+  background: #fff;
+  border-color: var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+}
+.candidate-assessment-summary h2 {
+  margin: 0 0 10px;
+  font: 600 16px/1.25 Georgia, serif;
+  color: var(--ink);
+}
+.candidate-assessment-summary p {
+  max-width: 82ch;
+  margin: 0 0 9px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+.candidate-assessment-summary p:last-child { margin-bottom: 0; }
+
+.policy-editor > label[for="assessment-profile"] {
+  display: block;
+  margin: 18px 0 7px;
+  color: #47534f;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.policy-editor > select#assessment-profile {
+  width: min(100%, 420px);
+  min-height: 42px;
+  padding: 10px 36px 10px 12px;
+  border: 1px solid #cfd5d1;
+  border-radius: 6px;
+  background: #fcfcfa;
+  color: var(--ink);
+  font: 600 11px/1.35 Inter, ui-sans-serif, system-ui, sans-serif;
+}
+.policy-editor > select#assessment-profile:disabled {
+  color: #7b8581;
+  background: #f0f2ef;
+  border-color: #cbd3cf;
+  opacity: 1;
+}
+.policy-editor > select#assessment-profile:focus-visible {
+  border-color: var(--desk);
+  box-shadow: 0 0 0 3px rgba(23, 105, 210, .15);
+}
+.policy-fields { align-items: stretch; }
+body .policy-editor .policy-field {
+  align-items: start;
+  min-width: 0;
+  gap: 16px;
+  padding: 14px;
+  line-height: 1.45;
+}
+body .policy-editor .policy-field > span { min-width: 0; }
+body .policy-editor .policy-field strong {
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.35;
+}
+body .policy-editor .policy-field small {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+body .policy-editor .policy-field small.policy-range {
+  color: #4e625a;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .01em;
+}
+body .policy-editor .policy-field small:last-child {
+  color: #66736f;
+  font-size: 9px;
+  font-style: italic;
+}
+body .policy-editor .policy-field input {
+  align-self: start;
+  min-height: 42px;
+  font-size: 11px;
+}
+
+.trading-confirmation {
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+  margin-top: 18px;
+  color: #47534f;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+.trading-confirmation span { display: block; }
+.trading-confirmation code {
+  display: inline-block;
+  max-width: 100%;
+  padding: 3px 6px;
+  border: 1px solid #cfd8dc;
+  border-radius: 4px;
+  background: #f1f4f6;
+  color: #35464d;
+  font: 700 10px/1.35 Inter, ui-sans-serif, system-ui, sans-serif;
+  overflow-wrap: anywhere;
+  vertical-align: baseline;
+}
+.trading-confirmation input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid #cfd5d1;
+  border-radius: 6px;
+  background: #fcfcfa;
+  color: var(--ink);
+}
+.trading-confirmation input:focus-visible {
+  border-color: var(--desk);
+  box-shadow: 0 0 0 3px rgba(23, 105, 210, .15);
+}
+
+.agent-api-grid {
+  align-items: stretch;
+}
+.agent-api-grid > .panel {
+  min-width: 0;
+  padding: 21px;
+  background: #fff;
+  color: var(--ink);
+}
+.agent-api-grid > .panel h2 {
+  margin: 0 0 12px;
+  font: 600 19px/1.3 Georgia, serif;
+  color: var(--ink);
+}
+.agent-api-grid > .panel h3 {
+  margin: 22px 0 9px;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.agent-api-grid > .panel p,
+.agent-api-grid > .panel li {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+.agent-api-grid > .panel p { margin: 0 0 12px; }
+.agent-api-grid > .panel ul,
+.agent-api-grid > .panel ol {
+  margin: 10px 0 14px;
+  padding-left: 20px;
+}
+.agent-api-grid > .panel li { margin: 6px 0; padding-left: 2px; }
+.agent-api-grid > .panel code {
+  color: #3d5f4d;
+  font: 600 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.agent-api-grid > .panel pre {
+  max-width: 100%;
+  margin: 12px 0 14px;
+  padding: 14px;
+  overflow-x: auto;
+  border: 1px solid #dbe1dc;
+  border-radius: 6px;
+  background: #f5f7f4;
+  color: #34423d;
+  font-size: 9px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.agent-api-grid > .panel pre code { font-size: inherit; }
+.agent-api-grid > .panel .policy-warning { margin-bottom: 18px; }
+.agent-api-grid > .panel .policy-field {
+  grid-template-columns: 1fr;
+  margin: 14px 0;
+}
+.agent-api-grid > .panel .policy-field input { width: 100%; }
+.agent-api-grid > .panel > button,
+.agent-api-grid > .panel li button,
+.agent-api-grid > .panel .form-message button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 9px 11px;
+  font-size: 10px;
+}
+.agent-api-grid > .panel > .agent-key-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 0;
+  list-style: none;
+}
+.agent-api-grid > .panel > .agent-key-list li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fcfcfa;
+}
+.agent-api-grid > .panel > ul:first-of-type li strong { color: var(--ink); font-size: 10px; }
+.agent-api-grid > .panel > ul:first-of-type li span { color: #9a3329; font-size: 9px; font-weight: 700; }
+.agent-api-grid > .panel .form-message {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.agent-api-grid > .panel .form-message code { max-width: 100%; }
+
+@media (max-width: 800px) {
+  .agent-api-grid > .panel { padding: 18px; }
+  body .policy-editor .policy-field { grid-template-columns: 1fr 110px; }
+}
+@media (max-width: 680px) {
+  .candidate-assessment-summary,
+  .agent-api-grid > .panel { padding: 17px; }
+  body .policy-editor .policy-field,
+  .agent-api-grid > .panel .policy-field { grid-template-columns: 1fr; }
+  .policy-editor > select#assessment-profile { width: 100%; }
+  .trading-confirmation { max-width: none; }
+}

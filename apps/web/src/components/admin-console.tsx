@@ -129,7 +129,7 @@ export function AdminConsole() {
             {tradingEnvironment.environment === "LIVE" ? tradingEnvironment.dangerous_warning : tradingEnvironment.preparation_state === "PREPARED" ? "LIVE target prepared only. PAPER remains active; the worker must establish its own live stream before execution." : "PAPER is the default and remains off for live trading."}
           </p>
           <div className="button-row"><button disabled={busy || tradingEnvironment.environment === "LIVE"} onClick={() => void prepareLive()}>Prepare LIVE</button><button disabled={busy || tradingEnvironment.environment === "PAPER"} onClick={() => void changeEnvironment("PAPER")}>Switch to PAPER</button><button disabled={busy || tradingEnvironment.environment === "LIVE" || tradingEnvironment.preparation_state !== "PREPARED"} onClick={() => void changeEnvironment("LIVE")}>Enable LIVE</button></div>
-          {tradingEnvironment.environment === "PAPER" ? <label>Type <code>{tradingEnvironment.live_confirmation_phrase}</code> to enable LIVE<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label> : null}
+          {tradingEnvironment.environment === "PAPER" ? <label className="trading-confirmation"><span>Type <code>{tradingEnvironment.live_confirmation_phrase}</code> to enable LIVE</span><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label> : null}
           {tradingEnvironment.preparation_state === "PREPARED" ? <p className="form-message">Prepared account: <code>{tradingEnvironment.target_account_id}</code>. Preparation expires quickly and never enables execution by itself.</p> : null}
         </section> : null}
         <h2 id="credential-settings-heading">Credential Settings</h2>

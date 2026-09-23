@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from packages.auth.jwt import AuthenticationError, VerifiedIdentity
 from packages.database.models import AppUserRecord, WorkspaceRecord
@@ -38,11 +39,9 @@ async def _sync_user(request: Request, identity: VerifiedIdentity) -> AuthPrinci
     now = datetime.now(UTC)
     is_bootstrap_admin = identity.email in request.app.state.settings.admin_emails
     async with database.sessions.begin() as session:
-        record = await session.scalar(
-            select(AppUserRecord).where(AppUserRecord.auth_subject == identity.subject)
-        )
-        if record is None:
-            record = AppUserRecord(
+        await session.execute(
+            pg_insert(AppUserRecord)
+            .values(
                 user_id=uuid4(),
                 auth_subject=identity.subject,
                 email=identity.email,
@@ -50,13 +49,17 @@ async def _sync_user(request: Request, identity: VerifiedIdentity) -> AuthPrinci
                 created_at=now,
                 last_seen_at=now,
             )
-            session.add(record)
-            await session.flush()
-        else:
-            record.email = identity.email
-            record.last_seen_at = now
-            if is_bootstrap_admin:
-                record.is_admin = True
+            .on_conflict_do_nothing(index_elements=[AppUserRecord.auth_subject])
+        )
+        record = await session.scalar(
+            select(AppUserRecord).where(AppUserRecord.auth_subject == identity.subject)
+        )
+        if record is None:
+            raise RuntimeError("User synchronization did not return the authenticated user")
+        record.email = identity.email
+        record.last_seen_at = now
+        if is_bootstrap_admin:
+            record.is_admin = True
         return AuthPrincipal(
             user_id=record.user_id,
             auth_subject=record.auth_subject,
