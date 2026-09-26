@@ -15,19 +15,18 @@ const opportunity = {
 };
 
 describe("OrderReview exit plan", () => {
-  it("keeps recommendation expiry separate and round trips an explicit local instant", async () => {
+  it("loads the exchange-session recommendation and posts it as an instant", async () => {
     deskFetch.mockReset();
-    deskFetch.mockResolvedValueOnce(opportunity).mockResolvedValueOnce([]).mockResolvedValueOnce({ trading_environment: "PAPER" }).mockResolvedValueOnce({ approval_id: "approval-1", opportunity_id: "opportunity-1", state: "APPROVED_FOR_SESSION", exit_plan: null });
+    deskFetch.mockResolvedValueOnce(opportunity).mockResolvedValueOnce([]).mockResolvedValueOnce({ trading_environment: "PAPER" }).mockResolvedValueOnce({ available: true, session_date: "2026-09-28", session_open: "2026-09-28T13:30:00Z", session_close: "2026-09-28T20:00:00Z", recommended_exit_at: "2026-09-28T19:55:00Z", timezone: "America/New_York", unavailable_reason: null }).mockResolvedValueOnce({ approval_id: "approval-1", opportunity_id: "opportunity-1", state: "APPROVED_FOR_SESSION", exit_plan: null });
     render(<OrderReview id="opportunity-1" />);
     const expiry = await screen.findByLabelText("Time-based exit");
-    expect(expiry).toHaveValue("");
-    fireEvent.change(expiry, { target: { value: "2026-09-26T01:30" } });
+    expect(expiry).toHaveValue("2026-09-28T15:55");
     fireEvent.change(screen.getByLabelText("Maximum loss exit"), { target: { value: "220" } });
     fireEvent.click(screen.getByRole("button", { name: "Approve for next U.S. session" }));
     await waitFor(() => expect(deskFetch.mock.calls.some(([, request]) => (request as RequestInit | undefined)?.method === "POST")).toBe(true));
     const request = deskFetch.mock.calls.find(([, request]) => (request as RequestInit | undefined)?.method === "POST")?.[1] as RequestInit;
     const body = JSON.parse(String(request.body));
-    expect(body.exit_plan.expires_at).toBe(new Date("2026-09-26T01:30").toISOString());
+    expect(body.exit_plan.expires_at).toBe("2026-09-28T19:55:00.000Z");
     expect(body.exit_plan.expires_at).not.toBe(opportunity.expires_at);
   });
 });

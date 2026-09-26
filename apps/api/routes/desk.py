@@ -334,6 +334,18 @@ class ConditionalApprovalView(BaseModel):
     exit_plan: dict[str, Any] | None
 
 
+class NextSessionExitRecommendation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    available: bool
+    session_date: date | None
+    session_open: datetime | None
+    session_close: datetime | None
+    recommended_exit_at: datetime | None
+    timezone: str = "America/New_York"
+    unavailable_reason: str | None = None
+
+
 def _credential_store(request: Request) -> CredentialStore:
     cipher = request.app.state.credential_cipher
     if cipher is None:
@@ -1055,6 +1067,65 @@ async def market_clock(
             status_code=422,
             detail=f"Real market clock unavailable ({type(error).__name__})",
         ) from error
+
+
+async def _next_session_exit_recommendation(
+    request: Request, context: WorkspaceContext
+) -> NextSessionExitRecommendation:
+    """Return a calendar-backed exit inside the next regular exchange session."""
+    try:
+        environment = await _workspace_environment(request, context.workspace_id)
+        secrets = await _credential_store(request).reveal(
+            context.workspace_id, _alpaca_provider(environment)
+        )
+        if secrets is None:
+            raise SessionCalendarUnavailable("Verified target Alpaca credentials required")
+        clock = await AlpacaMarketClockAdapter(
+            str(secrets["api_key_id"]),
+            str(secrets["secret_key"]),
+            environment=environment,
+        ).get_clock()
+        session_date = clock.next_open.astimezone(ZoneInfo("America/New_York")).date()
+        session = await AlpacaSessionCalendarAdapter(
+            str(secrets["api_key_id"]),
+            str(secrets["secret_key"]),
+            environment=environment,
+        ).get_session(session_date)
+        session_open = session.open
+        session_close = session.close
+        if session_open.tzinfo is None or session_open.utcoffset() is None:
+            session_open = session_open.replace(tzinfo=ZoneInfo("America/New_York"))
+        if session_close.tzinfo is None or session_close.utcoffset() is None:
+            session_close = session_close.replace(tzinfo=ZoneInfo("America/New_York"))
+        recommended_exit_at = session_close - timedelta(minutes=5)
+        if recommended_exit_at < session_open:
+            raise SessionCalendarUnavailable("Alpaca session window is invalid")
+        return NextSessionExitRecommendation(
+            available=True,
+            session_date=session_date,
+            session_open=session_open,
+            session_close=session_close,
+            recommended_exit_at=recommended_exit_at,
+        )
+    except Exception:
+        return NextSessionExitRecommendation(
+            available=False,
+            session_date=None,
+            session_open=None,
+            session_close=None,
+            recommended_exit_at=None,
+            unavailable_reason=(
+                "Next exchange-session exit unavailable; calendar evidence could not be read."
+            ),
+        )
+
+
+@router.get("/next-session-exit", response_model=NextSessionExitRecommendation)
+async def next_session_exit(
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> NextSessionExitRecommendation:
+    return await _next_session_exit_recommendation(request, context)
 
 
 async def _resolve_scan_mode(
