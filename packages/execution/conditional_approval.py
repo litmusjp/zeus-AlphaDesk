@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from packages.domain.workflow import OrderIntent, RankedCandidate
 
@@ -84,6 +85,34 @@ def validate_exit_plan(plan: object) -> str | None:
     if plan["stale_data_behavior"] != "FAIL_CLOSED":
         return "exit_plan_stale_data_policy_invalid"
     return None
+
+
+def validate_exit_plan_for_session(plan: object, *, session_date: date) -> str | None:
+    """Validate a persisted plan's exchange-session boundary.
+
+    New approvals are checked against Alpaca's authoritative calendar. This
+    deterministic check is the fail-closed boundary for legacy rows loaded
+    without that validation having been applied.
+    """
+    invalid = validate_exit_plan(plan)
+    if invalid:
+        return invalid
+    assert isinstance(plan, dict)
+    expiry = datetime.fromisoformat(str(plan["expires_at"]).replace("Z", "+00:00"))
+    eastern = expiry.astimezone(ZoneInfo("America/New_York"))
+    if eastern.weekday() >= 5:
+        return "exit_plan_expiry_not_regular_session"
+    if eastern.date() != session_date:
+        return "exit_plan_expiry_session_mismatch"
+    if eastern.time() < time(9, 30):
+        return "exit_plan_expiry_before_session_open"
+    if eastern.time() > time(16, 0):
+        return "exit_plan_expiry_after_session_close"
+    return None
+
+
+def exit_plan_renewal_required_reason(invalid_reason: str) -> str:
+    return f"exit_plan_invalid_requires_renewed_approval:{invalid_reason}"
 
 
 def validate_exit_plan_binding(

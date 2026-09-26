@@ -23,9 +23,11 @@ from packages.execution.conditional_approval import (
     ConditionalApproval,
     RevalidationDecision,
     candidate_structure_identity,
+    exit_plan_renewal_required_reason,
     order_structure_fingerprint,
     revalidate_for_submission,
     validate_exit_plan_binding,
+    validate_exit_plan_for_session,
 )
 from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.execution.connected_paper import PreSubmissionCheckFailed, execute_connected_order
@@ -359,12 +361,17 @@ async def process_workspace_approvals(
                 broker_account_id=approval_record.approved_broker_account_id or "",
                 environment=environment.value,
             )
+            if invalid_exit_plan is None:
+                invalid_exit_plan = validate_exit_plan_for_session(
+                    approval_record.exit_plan_payload,
+                    session_date=approval_record.session_date,
+                )
             if invalid_exit_plan:
                 await _finish(
                     approval_record.approval_id,
                     state=ApprovalState.CONDITION_FAILED,
                     now=now,
-                    reason=invalid_exit_plan,
+                    reason=exit_plan_renewal_required_reason(invalid_exit_plan),
                 )
                 continue
             service = ConnectedOpportunityService(

@@ -25,9 +25,11 @@ from packages.execution.conditional_approval import (
     approval_can_be_renewed,
     approval_is_active,
     evaluate_exit_plan,
+    exit_plan_renewal_required_reason,
     revalidate_exit_for_submission,
     revalidate_for_submission,
     validate_exit_plan,
+    validate_exit_plan_for_session,
 )
 from packages.execution.conditional_runner import _open_fill_response_is_valid, _open_order_matches
 from packages.execution.conditional_store import (
@@ -133,7 +135,7 @@ def valid_exit_plan(**overrides: object) -> dict[str, object]:
         "environment": "PAPER",
         "stop_loss": "220",
         "profit_target": "100",
-        "expires_at": "2026-09-19T20:00:00+00:00",
+        "expires_at": "2026-09-18T19:30:00+00:00",
         "stale_data_behavior": "FAIL_CLOSED",
     }
     plan.update(overrides)
@@ -683,6 +685,47 @@ def test_japan_local_saturday_can_be_a_valid_us_exchange_instant() -> None:
     local_display = datetime(2026, 9, 26, 1, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
     assert local_display.astimezone(ZoneInfo("America/New_York")).date() == date(2026, 9, 25)
     assert validate_exit_plan(valid_exit_plan(expires_at=local_display.isoformat())) is None
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "session_date", "reason"),
+    [
+        (
+            "2026-09-26T15:00:00+00:00",
+            date(2026, 9, 26),
+            "exit_plan_expiry_not_regular_session",
+        ),
+        (
+            "2026-09-28T05:22:00+00:00",
+            date(2026, 9, 28),
+            "exit_plan_expiry_before_session_open",
+        ),
+    ],
+)
+def test_legacy_exit_plan_session_boundary_fails_closed(
+    expires_at: str, session_date: date, reason: str
+) -> None:
+    invalid = validate_exit_plan_for_session(
+        valid_exit_plan(expires_at=expires_at), session_date=session_date
+    )
+
+    assert invalid == reason
+    assert exit_plan_renewal_required_reason(invalid) == (
+        f"exit_plan_invalid_requires_renewed_approval:{reason}"
+    )
+
+
+def test_legacy_exit_plan_accepts_friday_new_york_when_displayed_as_saturday_in_japan() -> None:
+    # 11:30 Friday in New York is 00:30 Saturday in Japan.
+    local_display = datetime(2026, 9, 26, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    assert (
+        validate_exit_plan_for_session(
+            valid_exit_plan(expires_at=local_display.isoformat()),
+            session_date=date(2026, 9, 25),
+        )
+        is None
+    )
 
 
 def test_persisted_exit_plan_is_not_mutated_and_invalid_plan_fails_closed() -> None:

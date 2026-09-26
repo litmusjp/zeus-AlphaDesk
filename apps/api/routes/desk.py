@@ -82,8 +82,10 @@ from packages.execution.conditional_approval import (
     approval_can_be_renewed,
     approval_is_active,
     candidate_structure_identity,
+    exit_plan_renewal_required_reason,
     order_structure_fingerprint,
     validate_exit_plan,
+    validate_exit_plan_for_session,
 )
 from packages.execution.connected_paper import execute_connected_paper_order
 from packages.execution.engine import SubmissionUncertain
@@ -1692,7 +1694,8 @@ async def _validate_open_exit_deadline(
 async def list_conditional_approvals(
     request: Request, context: WorkspaceContext = Depends(require_workspace)
 ) -> list[ConditionalApprovalView]:
-    async with request.app.state.database.sessions() as session:
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
         rows = list(
             await session.execute(
                 select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
@@ -1712,7 +1715,20 @@ async def list_conditional_approvals(
                 .limit(50)
             )
         )
-    return [_conditional_approval_view(record, symbol) for record, symbol in rows]
+        for record, _symbol in rows:
+            if (
+                record.approval_kind == "OPEN"
+                and record.state == ApprovalState.APPROVED_FOR_SESSION
+            ):
+                invalid_plan = validate_exit_plan_for_session(
+                    getattr(record, "exit_plan_payload", None),
+                    session_date=record.session_date,
+                )
+                if invalid_plan:
+                    record.state = ApprovalState.CONDITION_FAILED
+                    record.failure_reason = exit_plan_renewal_required_reason(invalid_plan)
+                    record.updated_at = now
+        return [_conditional_approval_view(record, symbol) for record, symbol in rows]
 
 
 def _validate_open_approval_renewal(
@@ -1848,7 +1864,19 @@ async def approve_for_next_session(
         )
         approval_action = "CONDITIONAL_APPROVAL_CREATED"
         if existing is not None:
-            if approval_is_active(existing.state, existing.expires_at, now):
+            legacy_exit_plan_reason = (
+                validate_exit_plan_for_session(
+                    getattr(existing, "exit_plan_payload", None),
+                    session_date=existing.session_date,
+                )
+                if existing.approval_kind == "OPEN"
+                and existing.state == ApprovalState.APPROVED_FOR_SESSION
+                else None
+            )
+            if (
+                approval_is_active(existing.state, existing.expires_at, now)
+                and not legacy_exit_plan_reason
+            ):
                 raise HTTPException(
                     status_code=409, detail="Opportunity already has an active approval"
                 )
@@ -1858,6 +1886,7 @@ async def approve_for_next_session(
                     existing.state == ApprovalState.APPROVED_FOR_SESSION
                     and existing.expires_at <= now
                 )
+                or legacy_exit_plan_reason
             ):
                 raise HTTPException(
                     status_code=409,
