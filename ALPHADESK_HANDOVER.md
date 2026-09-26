@@ -18,7 +18,8 @@ The current workstream focused on conditional/pre-approved trades and time-based
 - Git remote: `https://github.com/litmusjp/AlphaDesk.git`
 - GitHub canonical repository: `https://github.com/litmusjp/zeus-AlphaDesk`
 - Current branch: `fix/session-approval-expiry`
-- Latest commit: `e0ad1e1 fix(ui): recommend session-valid time exit`
+- Latest runtime commit: `e0ad1e1 fix(ui): recommend session-valid time exit`
+- Latest repository commit: `c6c4963 docs: add AlphaDesk handover brief`
 - Branch was clean and synchronized with origin at the last verification.
 - Relevant earlier commits:
   - `208a891 fix(trading): quarantine invalid legacy exit plans`
