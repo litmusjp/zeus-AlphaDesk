@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -52,6 +54,7 @@ class StrategyAssessmentRequest(BaseModel):
     market_evidence_at: datetime
     observed_at: datetime
     expires_at: datetime
+    request_autonomous_paper_authorization: bool = False
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> StrategyAssessmentRequest:
@@ -73,6 +76,25 @@ class AssessmentCheck(BaseModel):
     reason: str
 
 
+class AutonomousPaperAuthorization(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    allowed: bool
+    reason: str
+    authorization_id: UUID | None = None
+    fingerprint: str | None = None
+    mode: Literal["PAPER_ONLY"] | None = None
+    environment: Literal["PAPER"] | None = None
+    workspace_id: str | None = None
+    account_id: str | None = None
+    issuer: str = "AlphaDesk"
+    source: str = "strategy_assessment"
+    issued_at: datetime | None = None
+    expires_at: datetime | None = None
+    policy_version: str | None = None
+    strategy_identity: dict[str, Any] | None = None
+
+
 class StrategyAssessmentResult(BaseModel):
     model_config = ConfigDict(frozen=True, populate_by_name=True)
 
@@ -92,10 +114,96 @@ class StrategyAssessmentResult(BaseModel):
     paper_only: Literal[True] = True
     human_approval_required: Literal[True] = True
     execution_allowed: Literal[False] = False
+    autonomous_paper_authorization: AutonomousPaperAuthorization | None = None
 
 
 def _check(code: str, passed: bool, actual: Any, limit: Any, reason: str) -> AssessmentCheck:
     return AssessmentCheck(code=code, passed=passed, actual=actual, limit=limit, reason=reason)
+
+
+def _strategy_authorization_identity(request: StrategyAssessmentRequest) -> dict[str, Any]:
+    return {
+        "underlying_symbol": request.underlying_symbol.upper(),
+        "strategy_type": request.strategy_type,
+        "side": request.side,
+        "quantity": request.quantity,
+        "limit_price": format(request.limit_price, "f"),
+        "max_loss": format(request.max_loss, "f"),
+        "legs": [
+            {
+                "symbol": leg.symbol,
+                "side": leg.side,
+                "quantity": leg.quantity,
+                "price": format(leg.price, "f"),
+            }
+            for leg in request.legs
+        ],
+    }
+
+
+def build_autonomous_paper_authorization(
+    request: StrategyAssessmentRequest,
+    assessment: StrategyAssessmentResult,
+    *,
+    request_autonomous_paper_authorization: bool,
+    policy_enabled: bool,
+    workspace_id: str | UUID | None,
+    account_id: str | None,
+    environment: str = "PAPER",
+    guardian_ready: bool = False,
+    broker_evidence_available: bool = True,
+    now: datetime | None = None,
+) -> AutonomousPaperAuthorization | None:
+    if not request_autonomous_paper_authorization:
+        return None
+    current = now or datetime.now(UTC)
+    identity = _strategy_authorization_identity(request)
+    denial: str | None = None
+    if not policy_enabled:
+        denial = "autonomous_paper_authorization_disabled"
+    elif not assessment.pass_ or assessment.decision != "PASS":
+        denial = "assessment_not_pass"
+    elif not broker_evidence_available:
+        denial = "broker_evidence_unavailable"
+    elif not workspace_id:
+        denial = "workspace_identity_missing"
+    elif not account_id:
+        denial = "paper_account_identity_missing"
+    elif environment.upper() != "PAPER":
+        denial = "paper_environment_required"
+    elif not guardian_ready:
+        denial = "guardian_prerequisites_not_satisfied"
+    elif current >= request.expires_at:
+        denial = "assessment_expired"
+
+    if denial is not None:
+        return AutonomousPaperAuthorization(allowed=False, reason=denial)
+
+    binding = {
+        "strategy_identity": identity,
+        "workspace_id": str(workspace_id),
+        "account_id": account_id,
+        "environment": "PAPER",
+        "policy_version": assessment.policy_version,
+        "expires_at": request.expires_at.isoformat(),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return AutonomousPaperAuthorization(
+        allowed=True,
+        reason="authorized_for_paper_assessment_only",
+        authorization_id=uuid5(NAMESPACE_URL, f"alphadesk:paper:{fingerprint}"),
+        fingerprint=fingerprint,
+        mode="PAPER_ONLY",
+        environment="PAPER",
+        workspace_id=str(workspace_id),
+        account_id=account_id,
+        issued_at=current,
+        expires_at=request.expires_at,
+        policy_version=assessment.policy_version,
+        strategy_identity=identity,
+    )
 
 
 def assess_strategy(
@@ -113,9 +221,9 @@ def assess_strategy(
     checks.append(
         _check(
             "strategy_shape",
-            len(request.legs) in (2, 4),
+            len(request.legs) in (1, 2, 3, 4),
             len(request.legs),
-            "2 or 4",
+            "1 to 4",
             "Supported option strategy shape.",
         )
     )

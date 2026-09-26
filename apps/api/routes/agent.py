@@ -18,10 +18,12 @@ from packages.connected.strategy_assessment import (
     StrategyAssessmentRequest,
     StrategyAssessmentResult,
     assess_strategy,
+    build_autonomous_paper_authorization,
 )
 from packages.database.models import AgentAPIKeyRecord, WorkspaceRecord
 from packages.domain.broker import BrokerAccount, BrokerSyncStatus
 from packages.domain.system import BrokerState
+from packages.guardian.store import PostgresGuardianStore
 from packages.security.agent_keys import generate_agent_key, hash_agent_key, key_prefix
 
 router = APIRouter(prefix="/desk", tags=["agent-integrations"])
@@ -225,10 +227,29 @@ async def strategy_assessment(
         now=now,
         maximum_age=timedelta(seconds=policy.execution_max_quote_age_seconds),
     )
-    return assess_strategy(
+    assessment = assess_strategy(
         payload,
         policy,
         paper_equity=account.equity if account and broker_ready else None,
         broker_evidence_available=broker_ready,
         policy_updated_at=workspace.updated_at,
+    )
+    guardian = await PostgresGuardianStore(
+        database.sessions, key.workspace_id
+    ).status()
+    return assessment.model_copy(
+        update={
+            "autonomous_paper_authorization": build_autonomous_paper_authorization(
+                payload,
+                assessment,
+                request_autonomous_paper_authorization=payload.request_autonomous_paper_authorization,
+                policy_enabled=request.app.state.settings.autonomous_paper_authorization_enabled,
+                workspace_id=key.workspace_id,
+                account_id=account.account_id if broker_ready and account else None,
+                environment=account.environment if broker_ready and account else "PAPER",
+                guardian_ready=guardian.execution_allowed,
+                broker_evidence_available=broker_ready,
+                now=now,
+            )
+        }
     )

@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     workspace_connection_limit: int = Field(
         default=20, ge=1, le=100, validation_alias="ALPHADESK_WORKSPACE_CONNECTION_LIMIT"
     )
+    autonomous_paper_authorization_enabled: bool = Field(
+        default=False,
+        validation_alias="ALPHADESK_AUTONOMOUS_PAPER_AUTHORIZATION_ENABLED",
+    )
 
     @field_validator("mode", mode="before")
     @classmethod
