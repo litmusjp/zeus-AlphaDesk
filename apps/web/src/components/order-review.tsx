@@ -38,10 +38,9 @@ export function OrderReview({ id }: { id: string }) {
     setOpportunity(nextOpportunity);
     setApproval(approvals.find((item) => item.opportunity_id === id) ?? null);
     setWorkspace(nextWorkspace);
-    if (nextOpportunity.candidate?.structure?.max_loss && !stopLoss) setStopLoss(nextOpportunity.candidate.structure.max_loss);
-    if (nextOpportunity.candidate?.structure?.max_profit && !profitTarget) setProfitTarget(nextOpportunity.candidate.structure.max_profit);
-    if (!exitExpiry) setExitExpiry(nextOpportunity.expires_at.slice(0, 16));
-  }, [exitExpiry, id, profitTarget, stopLoss]);
+    if (nextOpportunity.candidate?.structure?.max_loss) setStopLoss((current) => current || nextOpportunity.candidate!.structure!.max_loss!);
+    if (nextOpportunity.candidate?.structure?.max_profit) setProfitTarget((current) => current || nextOpportunity.candidate!.structure!.max_profit!);
+  }, [id]);
 
   useEffect(() => {
     const kickoff = setTimeout(() => {

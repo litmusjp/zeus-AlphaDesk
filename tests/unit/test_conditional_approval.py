@@ -3,9 +3,11 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from apps.api.routes.desk import ExitPlanInput
 from packages.connected.market_clock import ConnectedMarketClock
 from packages.connected.opportunities import ConnectedAnalysis
 from packages.database.models import ConditionalApprovalRecord
@@ -142,9 +144,7 @@ def valid_exit_plan(**overrides: object) -> dict[str, object]:
     ("pl", "reason"),
     [(Decimal("-220"), "exit_plan_stop_loss"), (Decimal("100"), "exit_plan_profit_target")],
 )
-def test_exit_plan_evaluates_protection_and_planned_profit_taking(
-    pl: Decimal, reason: str
-) -> None:
+def test_exit_plan_evaluates_protection_and_planned_profit_taking(pl: Decimal, reason: str) -> None:
     result = evaluate_exit_plan(
         valid_exit_plan(),
         now=datetime(2026, 9, 18, 14, 31, tzinfo=UTC),
@@ -434,9 +434,7 @@ async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
     legs = (IntentLeg(symbol="AAPL261016C00200000", side="buy", ratio=1),)
     intent = OrderIntent(
         order_intent_id=uuid4(),
-        client_order_id=stable_client_order_id(
-            risk_id, legs, 1, Decimal("2.08"), "day", "LIMIT"
-        ),
+        client_order_id=stable_client_order_id(risk_id, legs, 1, Decimal("2.08"), "day", "LIMIT"),
         risk_decision_id=risk_id,
         legs=legs,
         quantity=1,
@@ -499,9 +497,7 @@ async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
     )
 
     service.return_value.analyze.assert_not_awaited()
-    adapter.assert_called_once_with(
-        "test-key", "test-secret", environment=TradingEnvironment.PAPER
-    )
+    adapter.assert_called_once_with("test-key", "test-secret", environment=TradingEnvironment.PAPER)
     adapter.return_value.get_clock.assert_awaited_once_with()
     store.release_revalidation.assert_awaited_once_with(
         record.approval_id,
@@ -672,3 +668,52 @@ def test_store_evidence_applies_done_for_day_fill_matrix(
         ),
     )
     assert _broker_evidence_is_valid(broker_record(), target, order) is expected
+
+
+def test_exit_plan_rejects_naive_timestamp_at_api_boundary() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ExitPlanInput(
+            stop_loss=Decimal("220"),
+            expires_at=datetime(2026, 9, 26, 22),
+            stale_data_behavior="FAIL_CLOSED",
+        )
+
+
+def test_japan_local_saturday_can_be_a_valid_us_exchange_instant() -> None:
+    local_display = datetime(2026, 9, 26, 1, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+    assert local_display.astimezone(ZoneInfo("America/New_York")).date() == date(2026, 9, 25)
+    assert validate_exit_plan(valid_exit_plan(expires_at=local_display.isoformat())) is None
+
+
+def test_persisted_exit_plan_is_not_mutated_and_invalid_plan_fails_closed() -> None:
+    valid_plan = valid_exit_plan()
+    valid_result = evaluate_exit_plan(
+        valid_plan,
+        now=datetime(2026, 9, 18, 12, tzinfo=UTC),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=Decimal("0"),
+        quote_age_seconds=4,
+        max_quote_age_seconds=30,
+    )
+
+    invalid_plan = valid_plan.copy()
+    invalid_plan["expires_at"] = "2026-09-26T22:00:00"
+
+    assert valid_result.decision is ExitPlanDecision.HOLD
+    assert valid_plan == valid_exit_plan()
+    assert validate_exit_plan(invalid_plan) == "exit_plan_expiry_not_timezone_aware"
+    result = evaluate_exit_plan(
+        invalid_plan,
+        now=datetime(2026, 9, 26, 12, tzinfo=UTC),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        broker_account_id="paper-account-1",
+        environment="PAPER",
+        unrealized_pl=Decimal("-1000"),
+        quote_age_seconds=4,
+        max_quote_age_seconds=30,
+    )
+
+    assert result.decision is ExitPlanDecision.FAIL_CLOSED
+    assert result.reason == "exit_plan_expiry_not_timezone_aware"

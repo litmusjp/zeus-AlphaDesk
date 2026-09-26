@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from alpaca.common.exceptions import APIError
 from anthropic import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import Select, delete, or_, select
 from sqlalchemy.exc import IntegrityError
 
@@ -41,7 +41,14 @@ from packages.connected.assessment_policy import (
     materialize_profile,
     profile_for_policy,
 )
-from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
+from packages.connected.market_clock import (
+    AlpacaMarketClockAdapter,
+    AlpacaSessionCalendarAdapter,
+    ConnectedMarketClock,
+    ExitOutsideSession,
+    SessionCalendarUnavailable,
+    SessionDateUnavailable,
+)
 from packages.connected.opportunities import (
     ConnectedAnalysis,
     ConnectedOpportunityService,
@@ -272,6 +279,13 @@ class ExitPlanInput(BaseModel):
     profit_target: Decimal | None = Field(default=None, gt=0)
     expires_at: datetime
     stale_data_behavior: Literal["FAIL_CLOSED"]
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_timezone_aware_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("exit plan expiry must be timezone-aware")
+        return value
 
 
 class ConditionalApprovalInput(BaseModel):
@@ -1637,6 +1651,43 @@ async def _next_session_window(
     return session_date, expires_at
 
 
+async def _validate_open_exit_deadline(
+    request: Request,
+    context: WorkspaceContext,
+    expires_at: datetime,
+    environment: TradingEnvironment,
+) -> None:
+    """Validate the user-selected exit against the exact Alpaca session date."""
+    secrets = await _credential_store(request).reveal(
+        context.workspace_id, _alpaca_provider(environment)
+    )
+    if secrets is None:
+        raise HTTPException(status_code=409, detail="Verified target Alpaca credentials required")
+    adapter = AlpacaSessionCalendarAdapter(
+        str(secrets["api_key_id"]), str(secrets["secret_key"]), environment=environment
+    )
+    try:
+        await adapter.validate_exit_in_session(expires_at)
+    except SessionCalendarUnavailable as error:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Exit deadline cannot be validated because the Alpaca market calendar "
+                "is unavailable; try again"
+            ),
+        ) from error
+    except SessionDateUnavailable as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Exit deadline is not on an Alpaca exchange session; choose a session time",
+        ) from error
+    except ExitOutsideSession as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Exit deadline must be within the selected Alpaca session open/close window",
+        ) from error
+
+
 @router.get("/approvals", response_model=list[ConditionalApprovalView])
 async def list_conditional_approvals(
     request: Request, context: WorkspaceContext = Depends(require_workspace)
@@ -1758,6 +1809,12 @@ async def approve_for_next_session(
             )
         if payload.exit_plan.expires_at <= now:
             raise HTTPException(status_code=422, detail="Exit plan expiry must be in the future")
+        await _validate_open_exit_deadline(
+            request,
+            context,
+            payload.exit_plan.expires_at,
+            TradingEnvironment(workspace.trading_environment),
+        )
         live_confirmation = None
         if workspace.trading_environment == TradingEnvironment.LIVE.value:
             if payload.live_order_confirmation != LIVE_CONFIRMATION_PHRASE:
