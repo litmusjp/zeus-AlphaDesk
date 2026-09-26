@@ -5,6 +5,7 @@ from decimal import Decimal
 from math import ceil
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -218,9 +219,47 @@ async def process_workspace_approvals(
     await store.reclaim_stale_revalidating(workspace_id=workspace_id, now=now)
     await _recover_ready_to_submit(database, store, cipher, workspace_id)
     await store.expire_before(workspace_id=workspace_id, now=now)
+    async with database.sessions() as session:
+        workspace = await session.scalar(
+            select(WorkspaceRecord).where(WorkspaceRecord.workspace_id == workspace_id)
+        )
+    if workspace is None:
+        return
+    environment = TradingEnvironment(workspace.trading_environment)
+    provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
+    secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
+    if secret is None:
+        return
+    try:
+        clock = await AlpacaMarketClockAdapter(
+            str(secret["api_key_id"]),
+            str(secret["secret_key"]),
+            environment=environment,
+        ).get_clock()
+    except Exception:
+        clock = None
+    clock_failure_reason = _opening_market_clock_failure_reason(clock)
+    if clock_failure_reason is not None:
+        logger.info(
+            "conditional_approval_revalidation",
+            extra={
+                "event": "conditional_approval_revalidation",
+                "workspace_id": str(workspace_id),
+                "stage": "initial_market_clock",
+                "reason_code": clock_failure_reason,
+                "retryable": True,
+            },
+        )
+        return
+    assert clock is not None
+    authoritative_session_date = clock.timestamp.astimezone(ZoneInfo("America/New_York")).date()
     while True:
         now = datetime.now(UTC)
-        approval_record = await store.claim_next(workspace_id=workspace_id, now=now)
+        approval_record = await store.claim_next(
+            workspace_id=workspace_id,
+            now=now,
+            session_date=authoritative_session_date,
+        )
         if approval_record is None:
             return
         claim_token = approval_record.claim_token
@@ -299,6 +338,14 @@ async def process_workspace_approvals(
                 workspace = await session.scalar(
                     select(WorkspaceRecord).where(WorkspaceRecord.workspace_id == workspace_id)
                 )
+            if workspace is None:
+                await _finish(
+                    approval_record.approval_id,
+                    state=ApprovalState.CONDITION_FAILED,
+                    now=now,
+                    reason="workspace_missing",
+                )
+                continue
             if original_record is None:
                 await _finish(
                     approval_record.approval_id,
@@ -320,40 +367,7 @@ async def process_workspace_approvals(
                 )
                 continue
             approved_intent = OrderIntent.model_validate(approval_record.approved_intent_payload)
-            if workspace is None:
-                await _finish(
-                    approval_record.approval_id,
-                    state=ApprovalState.CONDITION_FAILED,
-                    now=now,
-                    reason="workspace_missing",
-                )
-                continue
-            environment = TradingEnvironment(workspace.trading_environment)
-            provider = "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
             workspace_policy = workspace.assessment_policy
-            secret = await CredentialStore(database.sessions, cipher).reveal(workspace_id, provider)
-            if secret is None:
-                await _finish(
-                    approval_record.approval_id,
-                    state=ApprovalState.CONDITION_FAILED,
-                    now=now,
-                    reason="alpaca_credential_unavailable",
-                )
-                continue
-            gate_context["stage"] = "initial_market_clock"
-            # Defer before refreshing unavailable off-session quotes.
-            try:
-                clock = await AlpacaMarketClockAdapter(
-                    str(secret["api_key_id"]),
-                    str(secret["secret_key"]),
-                    environment=environment,
-                ).get_clock()
-            except Exception:
-                clock = None
-            clock_failure_reason = _opening_market_clock_failure_reason(clock)
-            if clock_failure_reason is not None:
-                await _release(clock_failure_reason)
-                return
             invalid_exit_plan = validate_exit_plan_binding(
                 approval_record.exit_plan_payload,
                 opening_approval_id=approval_record.approval_id,
@@ -488,12 +502,30 @@ async def process_workspace_approvals(
                     reason="option_quote_timestamp_invalid",
                 )
                 continue
+            gate_context["stage"] = "final_market_clock"
+            try:
+                clock = await AlpacaMarketClockAdapter(
+                    str(secret["api_key_id"]),
+                    str(secret["secret_key"]),
+                    environment=environment,
+                ).get_clock()
+            except Exception:
+                clock = None
+            clock_failure_reason = _opening_market_clock_failure_reason(clock)
+            if clock_failure_reason is not None:
+                await _release(clock_failure_reason)
+                return
+            assert clock is not None
+            authoritative_session_date = clock.timestamp.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            now = datetime.now(UTC)
             quote_age_seconds = max(0, ceil((now - min(leg_quote_times)).total_seconds()))
             gate_context["stage"] = "approval_bounds"
             result = revalidate_for_submission(
                 approval,
                 now=now,
-                session_date=approval_record.session_date,
+                session_date=authoritative_session_date,
                 structure_fingerprint=order_structure_fingerprint(fresh_intent),
                 limit_price=fresh_intent.limit_price,
                 maximum_loss=fresh_candidate.structure.max_loss,
@@ -515,20 +547,6 @@ async def process_workspace_approvals(
                     reason=result.reason,
                 )
                 continue
-            now = datetime.now(UTC)
-            gate_context["stage"] = "final_market_clock"
-            try:
-                clock = await AlpacaMarketClockAdapter(
-                    str(secret["api_key_id"]),
-                    str(secret["secret_key"]),
-                    environment=environment,
-                ).get_clock()
-            except Exception:
-                clock = None
-            clock_failure_reason = _opening_market_clock_failure_reason(clock)
-            if clock_failure_reason is not None:
-                await _release(clock_failure_reason)
-                return
             gate_context["stage"] = "submission_authorization"
             submission_token = await store.authorize_submission(
                 approval_record.approval_id,

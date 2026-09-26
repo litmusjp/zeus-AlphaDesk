@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +9,7 @@ import pytest
 
 from packages.connected import opportunities
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.market_clock import ConnectedMarketClock
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
 from packages.domain.system import TradingEnvironment
 from tests.unit.test_catalyst_workflow import approved_workflow
@@ -165,7 +166,22 @@ async def test_approved_refresh_classifies_failures(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["success", "structure", "stale", "broker", "risk", "guardian", "clock"]
+    "outcome",
+    [
+        "success",
+        "structure",
+        "stale",
+        "broker",
+        "risk",
+        "guardian",
+        "clock",
+        "future_then_success",
+        "all_future",
+        "final_session_mismatch",
+        "final_expired",
+        "final_quote_stale",
+        "japan_saturday_success",
+    ],
 )
 async def test_worker_uses_approved_refresh_and_final_gates(
     refresh_case: Any,
@@ -188,12 +204,17 @@ async def test_worker_uses_approved_refresh_and_final_gates(
 
     service, original, intent, _, _, _ = refresh_case
     now = datetime.now(UTC)
+    session_date = date(2026, 9, 25) if outcome == "japan_saturday_success" else date(2026, 9, 18)
+    approval_expires_at = now + timedelta(hours=1)
+    if outcome == "final_expired":
+        approval_expires_at = now + timedelta(seconds=1)
     candidate = RankedCandidate.model_validate(original.candidate)
     record = broker_record(
         approved_intent_payload=intent.model_dump(mode="json"),
         approved_structure_identity=candidate_structure_identity(candidate),
         client_order_id=intent.client_order_id,
-        expires_at=now + timedelta(hours=1),
+        session_date=session_date,
+        expires_at=approval_expires_at,
         structure_fingerprint=order_structure_fingerprint(intent),
         max_loss=Decimal("150"),
     )
@@ -202,6 +223,16 @@ async def test_worker_uses_approved_refresh_and_final_gates(
         structure_fingerprint=order_structure_fingerprint(intent),
         broker_account_id=record.approved_broker_account_id,
         environment=record.execution_environment,
+        expires_at=f"{session_date.isoformat()}T19:30:00+00:00",
+    )
+    future_record = broker_record(
+        approved_intent_payload=intent.model_dump(mode="json"),
+        approved_structure_identity=candidate_structure_identity(candidate),
+        client_order_id=intent.client_order_id,
+        session_date=date(2026, 9, 19),
+        expires_at=now + timedelta(hours=1),
+        structure_fingerprint=order_structure_fingerprint(intent),
+        max_loss=Decimal("150"),
     )
     fresh = original.model_copy(
         update={
@@ -234,14 +265,30 @@ async def test_worker_uses_approved_refresh_and_final_gates(
         )
     service.refresh_approved = AsyncMock(return_value=fresh)
     session = AsyncMock()
+    workspace = SimpleNamespace(trading_environment="PAPER", assessment_policy={})
     session.scalar.side_effect = [
+        workspace,
         SimpleNamespace(payload=original.model_dump(mode="json")),
-        SimpleNamespace(trading_environment="PAPER", assessment_policy={}),
+        workspace,
     ]
     database = MagicMock()
     database.sessions.return_value.__aenter__.return_value = session
     store = AsyncMock()
-    store.claim_next.side_effect = [record, None]
+    pending = (
+        [future_record, record]
+        if outcome == "future_then_success"
+        else ([future_record] if outcome == "all_future" else [record])
+    )
+
+    async def claim_next(**kwargs: Any) -> Any:
+        session_date = kwargs["session_date"]
+        for candidate in pending:
+            if candidate.session_date == session_date:
+                pending.remove(candidate)
+                return candidate
+        return None
+
+    store.claim_next.side_effect = claim_next
     monkeypatch.setattr(runner, "ConditionalApprovalStore", lambda _: store)
     monkeypatch.setattr(runner, "_recover_ready_to_submit", AsyncMock())
     monkeypatch.setattr(
@@ -252,8 +299,29 @@ async def test_worker_uses_approved_refresh_and_final_gates(
         ),
     )
     monkeypatch.setattr(runner, "ConnectedOpportunityService", lambda *_, **__: service)
-    clock = SimpleNamespace(is_open=True)
-    get_clock = AsyncMock(side_effect=[clock, SimpleNamespace(is_open=outcome != "clock")])
+    clock_timestamp = (
+        datetime(2026, 9, 25, 15, 30, tzinfo=UTC)
+        if outcome == "japan_saturday_success"
+        else datetime(2026, 9, 18, 14, tzinfo=UTC)
+    )
+    clock = ConnectedMarketClock(
+        is_open=True,
+        timestamp=clock_timestamp,
+        next_open=datetime(2026, 9, 19, 13, 30, tzinfo=UTC),
+        next_close=datetime(2026, 9, 19, 20, tzinfo=UTC),
+    )
+    final_clock_timestamp = (
+        datetime(2026, 9, 19, 14, tzinfo=UTC)
+        if outcome == "final_session_mismatch"
+        else clock_timestamp
+    )
+    closed_clock = ConnectedMarketClock(
+        is_open=outcome != "clock",
+        timestamp=final_clock_timestamp,
+        next_open=datetime(2026, 9, 19, 13, 30, tzinfo=UTC),
+        next_close=datetime(2026, 9, 19, 20, tzinfo=UTC),
+    )
+    get_clock = AsyncMock(side_effect=[clock, closed_clock])
     monkeypatch.setattr(
         runner, "AlpacaMarketClockAdapter", lambda *_, **__: SimpleNamespace(get_clock=get_clock)
     )
@@ -262,27 +330,66 @@ async def test_worker_uses_approved_refresh_and_final_gates(
     if outcome == "guardian":
         execute.side_effect = ExecutionBlocked("Guardian halted")
     monkeypatch.setattr(runner, "execute_connected_order", execute)
+    if outcome in {"final_expired", "final_quote_stale"}:
+
+        class DelayedDateTime:
+            calls = 0
+
+            @classmethod
+            def now(cls, tz: Any = None) -> datetime:
+                cls.calls += 1
+                current = (
+                    now
+                    + timedelta(
+                        hours=2 if outcome == "final_expired" else 0,
+                        seconds=31 if outcome == "final_quote_stale" else 0,
+                    )
+                    if cls.calls >= 4
+                    else now
+                )
+                return current if tz is None else current.astimezone(tz)
+
+        monkeypatch.setattr(runner, "datetime", DelayedDateTime)
     with caplog.at_level(logging.INFO):
         await runner.process_workspace_approvals(
             database=database, cipher=MagicMock(), workspace_id=record.workspace_id, now=now
         )
     service.analyze.assert_not_awaited()
-    service.refresh_approved.assert_awaited_once()
+    if outcome == "all_future":
+        service.refresh_approved.assert_not_awaited()
+    else:
+        service.refresh_approved.assert_awaited_once()
     if outcome in {"stale", "broker", "clock"}:
         store.release_revalidation.assert_awaited_once()
         store.finish.assert_not_awaited()
+    elif outcome in {"future_then_success", "all_future"}:
+        if outcome == "future_then_success":
+            assert future_record in pending
+        else:
+            assert pending == [future_record]
+        store.release_revalidation.assert_not_awaited()
+        if outcome == "all_future":
+            store.claim_next.assert_awaited_once()
+    elif outcome in {"final_session_mismatch", "final_expired", "final_quote_stale"}:
+        if outcome == "final_quote_stale":
+            store.release_revalidation.assert_awaited_once()
+            assert store.release_revalidation.await_args.kwargs["reason"] == "quote_stale"
+        else:
+            assert store.finish.await_args.kwargs["reason"] == "approval_session_mismatch"
+        store.authorize_submission.assert_not_awaited()
     elif outcome in {"structure", "risk", "guardian"}:
         assert store.finish.await_args.kwargs["state"] == ApprovalState.CONDITION_FAILED
-    if outcome in {"success", "guardian"}:
+    if outcome in {"success", "guardian", "future_then_success", "japan_saturday_success"}:
         execute.assert_awaited_once()
         store.authorize_submission.assert_awaited_once()
         assert get_clock.await_count == 2
     else:
         execute.assert_not_awaited()
         store.authorize_submission.assert_not_awaited()
-    assert any(
-        getattr(item, "approval_id", None) == str(record.approval_id)
-        and getattr(item, "stage", None)
-        and getattr(item, "reason_code", None)
-        for item in caplog.records
-    )
+    if outcome != "all_future":
+        assert any(
+            getattr(item, "approval_id", None) == str(record.approval_id)
+            and getattr(item, "stage", None)
+            and getattr(item, "reason_code", None)
+            for item in caplog.records
+        )

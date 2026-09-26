@@ -269,7 +269,7 @@ def revalidate_for_submission(
 ) -> RevalidationResult:
     if approval.state is not ApprovalState.APPROVED_FOR_SESSION:
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "approval_not_pending")
-    if now >= approval.expires_at:
+    if session_date != approval.session_date or now >= approval.expires_at:
         return RevalidationResult(RevalidationDecision.EXPIRED, "approval_session_mismatch")
     if structure_fingerprint != approval.structure_fingerprint:
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "structure_changed")

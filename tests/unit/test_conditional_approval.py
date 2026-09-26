@@ -1,7 +1,7 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -123,6 +123,22 @@ def test_revalidation_allows_one_approved_session_submission() -> None:
     assert result.decision is RevalidationDecision.READY_TO_SUBMIT
 
 
+def test_revalidation_rejects_open_approval_on_a_different_session() -> None:
+    result = revalidate_for_submission(
+        approval(),
+        now=datetime(2026, 9, 18, 14, 31, tzinfo=UTC),
+        session_date=date(2026, 9, 19),
+        structure_fingerprint="AAPL-20261016-200C-205C",
+        limit_price=Decimal("2.08"),
+        maximum_loss=Decimal("208"),
+        quantity=1,
+        quote_age_seconds=4,
+    )
+
+    assert result.decision is RevalidationDecision.EXPIRED
+    assert result.reason == "approval_session_mismatch"
+
+
 def test_next_session_open_approval_requires_an_explicit_exit_plan() -> None:
     assert validate_exit_plan(None) is not None
 
@@ -235,13 +251,12 @@ def test_revalidation_rejects_stale_quote_and_wrong_structure() -> None:
     assert result.reason in {"structure_changed", "quote_stale"}
 
 
-def test_revalidation_allows_next_broker_session_after_holiday_or_early_close() -> None:
+def test_revalidation_rejects_a_later_broker_session_after_approval_expiry_window() -> None:
     result = revalidate_for_submission(
         approval(expires_at=datetime(2026, 9, 22, 20, tzinfo=UTC)),
-        # The approval was created for the prior local date.  The broker clock
-        # has already advanced to the next valid regular session (for example
-        # after a holiday or an early close), so local-date equality is not an
-        # execution authorization.
+        # An approval is bound to its approved entry session. A later broker
+        # session requires a fresh approval, even if the original expiry has
+        # not elapsed.
         now=datetime(2026, 9, 21, 14, 31, tzinfo=UTC),
         session_date=date(2026, 9, 21),
         structure_fingerprint="AAPL-20261016-200C-205C",
@@ -251,7 +266,8 @@ def test_revalidation_allows_next_broker_session_after_holiday_or_early_close() 
         quote_age_seconds=4,
     )
 
-    assert result.decision is RevalidationDecision.READY_TO_SUBMIT
+    assert result.decision is RevalidationDecision.EXPIRED
+    assert result.reason == "approval_session_mismatch"
 
 
 def test_expired_approval_is_not_active_and_can_be_renewed() -> None:
@@ -429,8 +445,12 @@ def broker_record(**overrides: object) -> ConditionalApprovalRecord:
 
 @pytest.mark.parametrize("clock_status", ["closed", "unavailable", "error"])
 async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
-    monkeypatch: pytest.MonkeyPatch, clock_status: str
+    monkeypatch: pytest.MonkeyPatch,
+    clock_status: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    import logging
+
     now = datetime.now(UTC)
     risk_id = uuid4()
     legs = (IntentLeg(symbol="AAPL261016C00200000", side="buy", ratio=1),)
@@ -460,13 +480,13 @@ async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
     )
     session = AsyncMock()
     session.scalar.side_effect = [
-        SimpleNamespace(payload=original.model_dump(mode="json")),
         SimpleNamespace(trading_environment="PAPER", assessment_policy={}),
+        SimpleNamespace(payload=original.model_dump(mode="json")),
     ]
     database = MagicMock()
     database.sessions.return_value.__aenter__.return_value = session
     store = AsyncMock()
-    store.claim_next.side_effect = [record, None]
+    store.claim_next.return_value = None
     monkeypatch.setattr(conditional_runner, "ConditionalApprovalStore", lambda _: store)
     monkeypatch.setattr(conditional_runner, "_recover_ready_to_submit", AsyncMock())
     credentials = MagicMock()
@@ -494,28 +514,30 @@ async def test_closed_or_unavailable_clock_defers_before_execution_analysis(
     execute = AsyncMock()
     monkeypatch.setattr(conditional_runner, "execute_connected_order", execute)
 
-    await conditional_runner.process_workspace_approvals(
-        database=database, cipher=MagicMock(), workspace_id=record.workspace_id, now=now
-    )
+    with caplog.at_level(logging.INFO):
+        await conditional_runner.process_workspace_approvals(
+            database=database, cipher=MagicMock(), workspace_id=record.workspace_id, now=now
+        )
 
     service.return_value.analyze.assert_not_awaited()
     adapter.assert_called_once_with("test-key", "test-secret", environment=TradingEnvironment.PAPER)
     adapter.return_value.get_clock.assert_awaited_once_with()
-    store.release_revalidation.assert_awaited_once_with(
-        record.approval_id,
-        workspace_id=record.workspace_id,
-        claim_token=record.claim_token,
-        now=ANY,
-        reason=(
-            "market_session_closed"
-            if clock_status == "closed"
-            else "authoritative_market_clock_unavailable"
-        ),
-    )
+    store.release_revalidation.assert_not_awaited()
     store.finish.assert_not_awaited()
     store.authorize_submission.assert_not_awaited()
     execute.assert_not_awaited()
-    store.claim_next.assert_awaited_once()
+    store.claim_next.assert_not_awaited()
+    assert any(
+        getattr(item, "workspace_id", None) == str(record.workspace_id)
+        and getattr(item, "stage", None) == "initial_market_clock"
+        and getattr(item, "reason_code", None)
+        == (
+            "market_session_closed"
+            if clock_status == "closed"
+            else "authoritative_market_clock_unavailable"
+        )
+        for item in caplog.records
+    )
 
 
 def broker_order(**overrides: object) -> BrokerOrder:
