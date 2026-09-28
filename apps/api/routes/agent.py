@@ -14,14 +14,16 @@ from sqlalchemy import select
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.external_account import ExternalAccountProvider
 from packages.connected.strategy_assessment import (
     StrategyAssessmentRequest,
     StrategyAssessmentResult,
     assess_strategy,
 )
-from packages.database.models import AgentAPIKeyRecord, WorkspaceRecord
+from packages.database.models import AgentAPIKeyRecord, ConnectedOpportunityRecord, WorkspaceRecord
 from packages.domain.broker import BrokerAccount, BrokerSyncStatus
 from packages.domain.system import BrokerState
+from packages.domain.workflow import CatalystFeatures, Signal
 from packages.security.agent_keys import generate_agent_key, hash_agent_key, key_prefix
 
 router = APIRouter(prefix="/desk", tags=["agent-integrations"])
@@ -216,14 +218,78 @@ async def strategy_assessment(
         raise HTTPException(status_code=404, detail="Workspace not found")
     policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
     if payload.is_external:
-        # External identity is an explicit OP contract. AlphaDesk's own broker
-        # projection must never be used as third-account evidence.
+        provider: ExternalAccountProvider | None = getattr(
+            request.app.state, "external_account_provider", None
+        )
+        external_evidence = None
+        if provider is not None:
+            try:
+                candidate = await provider.get_account(
+                    workspace_id=key.workspace_id,
+                    key_id=key.key_id,
+                    account_id=payload.external_account_id or "",
+                    sandbox_id=payload.external_sandbox_id or "",
+                    environment=payload.external_environment or "",
+                )
+                if (
+                    candidate is not None
+                    and candidate.account_id == payload.external_account_id
+                    and candidate.sandbox_id == payload.external_sandbox_id
+                    and candidate.environment == "PAPER"
+                ):
+                    evidence_age = datetime.now(UTC) - candidate.fetched_at
+                    if timedelta(0) <= evidence_age <= timedelta(
+                        seconds=policy.execution_max_quote_age_seconds
+                    ):
+                        external_evidence = candidate
+            except Exception:
+                # Provider failures are deliberately indistinguishable from absent evidence.
+                external_evidence = None
+        trusted_features: CatalystFeatures | None = None
+        trusted_observed_at: datetime | None = None
+        if external_evidence is not None:
+            now = datetime.now(UTC)
+            try:
+                async with database.sessions() as session:
+                    opportunity = await session.scalar(
+                        select(ConnectedOpportunityRecord)
+                        .where(
+                            ConnectedOpportunityRecord.workspace_id == key.workspace_id,
+                            ConnectedOpportunityRecord.symbol == payload.underlying_symbol.upper(),
+                            ConnectedOpportunityRecord.source == "ALPACA_REAL",
+                            ConnectedOpportunityRecord.observed_at <= now,
+                            ConnectedOpportunityRecord.expires_at >= now,
+                        )
+                        .order_by(ConnectedOpportunityRecord.observed_at.desc())
+                    )
+                if opportunity is not None:
+                    raw_signal = opportunity.payload.get("signal", {})
+                    signal = Signal.model_validate(raw_signal)
+                    signal_age = now - signal.observed_at
+                    if (
+                        signal.symbol == payload.underlying_symbol.upper()
+                        and signal.source_versions
+                        and signal.observed_at == opportunity.observed_at
+                        and timedelta(0) <= signal_age <= timedelta(
+                            seconds=policy.execution_max_quote_age_seconds
+                        )
+                    ):
+                        trusted_features = CatalystFeatures.model_validate(signal.features)
+                        trusted_observed_at = signal.observed_at
+            except Exception:
+                trusted_features = None
+                trusted_observed_at = None
         return assess_strategy(
             payload,
             policy,
-            paper_equity=None,
-            broker_evidence_available=False,
+            paper_equity=external_evidence.equity if external_evidence else None,
+            broker_evidence_available=external_evidence is not None,
             policy_updated_at=workspace.updated_at,
+            trusted_market_features=trusted_features,
+            trusted_score_source=(
+                "alphadesk_connected_opportunity" if trusted_features is not None else None
+            ),
+            trusted_score_observed_at=trusted_observed_at,
         )
     projections = PostgresBrokerProjectionStore(database.sessions, key.workspace_id)
     status = await projections.get_status()

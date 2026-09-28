@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -113,6 +113,8 @@ class StrategyAssessmentResult(BaseModel):
     human_approval_required: Literal[True] = True
     execution_allowed: Literal[False] = False
     external_identity: dict[str, str] | None = None
+    score_source: str | None = None
+    score_observed_at: datetime | None = None
 
 
 def _check(code: str, passed: bool, actual: Any, limit: Any, reason: str) -> AssessmentCheck:
@@ -127,6 +129,9 @@ def assess_strategy(
     broker_evidence_available: bool = True,
     now: datetime | None = None,
     policy_updated_at: datetime | None = None,
+    trusted_market_features: CatalystFeatures | None = None,
+    trusted_score_source: str | None = None,
+    trusted_score_observed_at: datetime | None = None,
 ) -> StrategyAssessmentResult:
     current = now or datetime.now(UTC)
     age = max(Decimal("0"), Decimal(str((current - request.market_evidence_at).total_seconds())))
@@ -259,6 +264,55 @@ def assess_strategy(
                 "Planned loss is within the policy percentage of paper equity.",
             )
         )
+    score_features = (
+        trusted_market_features if request.is_external else request.market_scanner_features
+    )
+    score_source = trusted_score_source if request.is_external else (
+        "caller_market_scanner_features" if request.market_scanner_features is not None else None
+    )
+    score_observed_at = trusted_score_observed_at if request.is_external else (
+        request.market_evidence_at if request.market_scanner_features is not None else None
+    )
+    calculated_signal_score = (
+        score_signal(score_features) if score_features is not None else None
+    )
+    market_scanner_signal_score = calculated_signal_score
+    if request.is_external:
+        score_ready = (
+            calculated_signal_score is not None
+            and score_source == "alphadesk_connected_opportunity"
+            and broker_evidence_available
+            and paper_equity is not None
+            and paper_equity > 0
+            and score_observed_at is not None
+            and current >= score_observed_at
+            and current - score_observed_at <= timedelta(
+                seconds=policy.execution_max_quote_age_seconds
+            )
+        )
+        checks.append(
+            _check(
+                "market_scanner_score_evidence",
+                score_ready,
+                calculated_signal_score if score_ready else None,
+                policy.minimum_signal_score,
+                "A fresh AlphaDesk-owned market signal is required for external assessment.",
+            )
+        )
+        if calculated_signal_score is not None and score_ready:
+            checks.append(
+                _check(
+                    "minimum_signal_score",
+                    calculated_signal_score >= policy.minimum_signal_score,
+                    calculated_signal_score,
+                    policy.minimum_signal_score,
+                    "The trusted market signal meets the workspace minimum score.",
+                )
+            )
+        if not score_ready:
+            market_scanner_signal_score = None
+            score_source = None
+            score_observed_at = None
     failed = tuple(check.code for check in checks if not check.passed)
     decision: Literal["PASS", "FAIL", "UNAVAILABLE"] = (
         "PASS"
@@ -267,25 +321,17 @@ def assess_strategy(
             "UNAVAILABLE"
             if any(
                 code in failed
-                for code in (
+                for code in {
                     "external_account_evidence",
                     "external_equity_evidence",
                     "broker_evidence",
                     "paper_equity",
                     "evidence_fresh",
-                )
+                    "market_scanner_score_evidence",
+                }
             )
             else "FAIL"
         )
-    )
-    market_scanner_signal_score = (
-        score_signal(request.market_scanner_features)
-        if request.market_scanner_features is not None
-        and (
-            not request.is_external
-            or (broker_evidence_available and paper_equity is not None and paper_equity > 0)
-        )
-        else None
     )
     return StrategyAssessmentResult(
         pass_=not failed,
@@ -314,4 +360,6 @@ def assess_strategy(
             if request.is_external
             else None
         ),
+        score_source=score_source,
+        score_observed_at=score_observed_at,
     )

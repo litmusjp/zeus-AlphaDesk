@@ -16,6 +16,7 @@ from apps.api.routes.system import router as system_router
 from packages.auth.jwt import SupabaseJWTVerifier
 from packages.auth.supabase_admin import SupabaseAdminAuth
 from packages.configuration.settings import Settings, get_settings
+from packages.connected.external_account import AlpacaExternalAccountProvider
 from packages.database.session import Database
 from packages.event_bus.client import JetStreamEventBus
 from packages.observability.logging import configure_logging, get_logger
@@ -41,6 +42,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.auth_verifier = None
         app.state.supabase_admin = None
         app.state.credential_cipher = None
+        app.state.external_account_provider = None
+        if resolved_settings.external_account_bindings_json is not None:
+            try:
+                app.state.external_account_provider = AlpacaExternalAccountProvider.from_json(
+                    resolved_settings.external_account_bindings_json.get_secret_value()
+                )
+                app.state.readiness["external_account_bindings"] = "healthy"
+            except ValueError:
+                app.state.readiness["external_account_bindings"] = "unhealthy"
 
         if resolved_settings.infrastructure_checks:
             database = Database(resolved_settings.database_url)
@@ -113,6 +123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.auth_verifier = None
     application.state.supabase_admin = None
     application.state.credential_cipher = None
+    application.state.external_account_provider = None
 
     application.include_router(health_router)
     application.include_router(system_router, prefix="/api/v1")
