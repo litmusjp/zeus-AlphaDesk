@@ -52,6 +52,9 @@ class StrategyAssessmentRequest(BaseModel):
     market_evidence_at: datetime
     observed_at: datetime
     expires_at: datetime
+    external_account_id: str | None = Field(default=None, min_length=1, max_length=128)
+    external_sandbox_id: str | None = Field(default=None, min_length=1, max_length=128)
+    external_environment: Literal["PAPER"] | None = None
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> StrategyAssessmentRequest:
@@ -60,7 +63,24 @@ class StrategyAssessmentRequest(BaseModel):
             raise ValueError("assessment timestamps must be timezone-aware")
         if self.expires_at <= self.observed_at:
             raise ValueError("expires_at must be after observed_at")
+        if self.is_external and (
+            not self.external_account_id
+            or not self.external_sandbox_id
+            or self.external_environment != "PAPER"
+        ):
+            raise ValueError("external assessments require an exact PAPER account and sandbox")
         return self
+
+    @property
+    def is_external(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.external_account_id,
+                self.external_sandbox_id,
+                self.external_environment,
+            )
+        )
 
 
 class AssessmentCheck(BaseModel):
@@ -92,6 +112,7 @@ class StrategyAssessmentResult(BaseModel):
     paper_only: Literal[True] = True
     human_approval_required: Literal[True] = True
     execution_allowed: Literal[False] = False
+    external_identity: dict[str, str] | None = None
 
 
 def _check(code: str, passed: bool, actual: Any, limit: Any, reason: str) -> AssessmentCheck:
@@ -137,13 +158,19 @@ def assess_strategy(
             "Quantity is within the workspace policy cap.",
         )
     )
+    evidence_code = "external_account_evidence" if request.is_external else "broker_evidence"
     checks.append(
         _check(
-            "broker_evidence",
+            evidence_code,
             broker_evidence_available,
             broker_evidence_available,
             True,
-            "Fresh reconciled paper account evidence is required.",
+            (
+                "Fresh independently established evidence for the requested external paper "
+                "account is required."
+                if request.is_external
+                else "Fresh reconciled paper account evidence is required."
+            ),
         )
     )
     checks.append(
@@ -205,7 +232,17 @@ def assess_strategy(
             "Strategy Greeks must be complete.",
         )
     )
-    if paper_equity is None or paper_equity <= 0:
+    if request.is_external and (paper_equity is None or paper_equity <= 0):
+        checks.append(
+            _check(
+                "external_equity_evidence",
+                False,
+                paper_equity,
+                "> 0",
+                "Independent external paper equity is unavailable.",
+            )
+        )
+    elif paper_equity is None or paper_equity <= 0:
         checks.append(
             _check(
                 "paper_equity", False, paper_equity, "> 0", "Current paper equity is unavailable."
@@ -228,13 +265,26 @@ def assess_strategy(
         if not failed
         else (
             "UNAVAILABLE"
-            if any(code in failed for code in ("broker_evidence", "paper_equity", "evidence_fresh"))
+            if any(
+                code in failed
+                for code in (
+                    "external_account_evidence",
+                    "external_equity_evidence",
+                    "broker_evidence",
+                    "paper_equity",
+                    "evidence_fresh",
+                )
+            )
             else "FAIL"
         )
     )
     market_scanner_signal_score = (
         score_signal(request.market_scanner_features)
         if request.market_scanner_features is not None
+        and (
+            not request.is_external
+            or (broker_evidence_available and paper_equity is not None and paper_equity > 0)
+        )
         else None
     )
     return StrategyAssessmentResult(
@@ -255,4 +305,13 @@ def assess_strategy(
         market_evidence_at=request.market_evidence_at,
         observed_at=request.observed_at,
         expires_at=request.expires_at,
+        external_identity=(
+            {
+                "account_id": request.external_account_id,
+                "sandbox_id": request.external_sandbox_id,
+                "environment": request.external_environment,
+            }
+            if request.is_external
+            else None
+        ),
     )

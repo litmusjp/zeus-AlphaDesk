@@ -74,7 +74,6 @@ def test_assessment_reuses_policy_and_returns_stable_checks() -> None:
     assert result.execution_allowed is False
 
 
-
 def test_assessment_returns_canonical_market_scanner_signal_score() -> None:
     features = CatalystFeatures(
         catalyst_confidence="0.90",
@@ -111,3 +110,36 @@ def test_malformed_or_stale_strategy_fails_closed() -> None:
         "evidence_fresh" in result.failed_check_codes
         or "strategy_shape" in result.failed_check_codes
     )
+
+
+def test_native_assessment_keeps_broker_evidence_and_optional_external_identity() -> None:
+    result = assess_strategy(
+        payload(), AssessmentPolicy(), paper_equity=Decimal("10000"), broker_evidence_available=True
+    )
+    assert result.decision == "PASS"
+    assert "broker_evidence" in {check.code for check in result.checks}
+    assert result.external_identity is None
+
+
+def test_external_assessment_requires_identity_and_missing_external_evidence_is_unavailable() -> (
+    None
+):
+    result = assess_strategy(
+        payload(
+            external_account_id="op-paper-l1",
+            external_sandbox_id="op-sandbox-l1",
+            external_environment="PAPER",
+        ),
+        AssessmentPolicy(),
+        paper_equity=None,
+        broker_evidence_available=False,
+    )
+    assert result.decision == "UNAVAILABLE"
+    assert result.pass_ is False
+    assert "external_account_evidence" in result.failed_check_codes
+    assert "external_equity_evidence" in result.failed_check_codes
+    assert result.external_identity == {
+        "account_id": "op-paper-l1",
+        "sandbox_id": "op-sandbox-l1",
+        "environment": "PAPER",
+    }

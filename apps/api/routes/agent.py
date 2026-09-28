@@ -215,6 +215,16 @@ async def strategy_assessment(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     policy = AssessmentPolicy.from_payload(workspace.assessment_policy)
+    if payload.is_external:
+        # External identity is an explicit OP contract. AlphaDesk's own broker
+        # projection must never be used as third-account evidence.
+        return assess_strategy(
+            payload,
+            policy,
+            paper_equity=None,
+            broker_evidence_available=False,
+            policy_updated_at=workspace.updated_at,
+        )
     projections = PostgresBrokerProjectionStore(database.sessions, key.workspace_id)
     status = await projections.get_status()
     account = await projections.get_account()
