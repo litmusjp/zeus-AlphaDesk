@@ -74,6 +74,32 @@ def test_assessment_reuses_policy_and_returns_stable_checks() -> None:
     assert result.execution_allowed is False
 
 
+def test_signal_quality_scope_does_not_require_broker_equity() -> None:
+    now = datetime.now(UTC)
+    result = assess_strategy(
+        payload(
+            scope="SIGNAL_QUALITY",
+            external_account_id="declared-paper",
+            external_sandbox_id="declared-sandbox",
+            external_environment="PAPER",
+        ),
+        AssessmentPolicy(),
+        broker_evidence_available=False,
+        now=now,
+        trusted_market_features=CatalystFeatures(
+            catalyst_confidence="1", sentiment="1", relative_volume="4",
+            price_momentum="1", gap_percent="0", market_confirmation="1",
+            sector_confirmation="1", liquidity_score="1",
+        ),
+        trusted_score_source="alphadesk_connected_opportunity",
+        trusted_score_observed_at=now,
+        trusted_signal_direction="BULLISH",
+    )
+    assert result.scope == "SIGNAL_QUALITY"
+    assert "external_account_evidence" not in result.failed_check_codes
+    assert "external_equity_evidence" not in result.failed_check_codes
+
+
 def test_assessment_returns_canonical_market_scanner_signal_score() -> None:
     features = CatalystFeatures(
         catalyst_confidence="0.90",
@@ -143,3 +169,131 @@ def test_external_assessment_requires_identity_and_missing_external_evidence_is_
         "sandbox_id": "op-sandbox-l1",
         "environment": "PAPER",
     }
+
+
+def test_native_four_leg_shape_preserves_existing_contract() -> None:
+    base = payload().model_dump(mode="python")
+    base["legs"] = tuple(
+        [*base["legs"], base["legs"][0], base["legs"][1]]
+    )
+    result = assess_strategy(
+        StrategyAssessmentRequest.model_validate(base),
+        AssessmentPolicy(),
+        paper_equity=Decimal("10000"),
+    )
+    assert result.decision == "PASS"
+    assert "strategy_shape" not in result.failed_check_codes
+
+
+def test_signal_quality_uses_occ_type_not_root_char_and_requires_typed_strategy() -> None:
+    request = payload(
+        scope="SIGNAL_QUALITY",
+        external_account_id="declared-paper",
+        external_sandbox_id="declared-sandbox",
+        external_environment="PAPER",
+        strategy_type="bull_call_debit_spread",
+        legs=(
+            {
+                **payload().legs[0].model_dump(),
+                "symbol": "C260117P00200000",
+            },
+        ),
+    )
+    result = assess_strategy(
+        request,
+        AssessmentPolicy(),
+        broker_evidence_available=False,
+        trusted_market_features=CatalystFeatures(
+            catalyst_confidence="1", sentiment="-1", relative_volume="4",
+            price_momentum="-1", gap_percent="0", market_confirmation="-1",
+            sector_confirmation="-1", liquidity_score="1",
+        ),
+        trusted_score_source="alphadesk_connected_opportunity",
+        trusted_score_observed_at=request.market_evidence_at,
+        trusted_signal_direction="BEARISH",
+        now=request.market_evidence_at,
+    )
+    assert result.decision == "FAIL"
+    assert "strategy_shape" in result.failed_check_codes
+
+
+def test_signal_quality_rejects_malformed_option_identity() -> None:
+    request = payload(
+        scope="SIGNAL_QUALITY",
+        external_account_id="declared-paper",
+        external_sandbox_id="declared-sandbox",
+        external_environment="PAPER",
+        legs=tuple(
+            leg.model_copy(update={"symbol": "AAPL-not-an-occ-identity"})
+            if index == 0
+            else leg
+            for index, leg in enumerate(payload().legs)
+        ),
+    )
+    result = assess_strategy(
+        request,
+        AssessmentPolicy(),
+        broker_evidence_available=False,
+        trusted_market_features=CatalystFeatures(
+            catalyst_confidence="1", sentiment="1", relative_volume="4",
+            price_momentum="1", gap_percent="0", market_confirmation="1",
+            sector_confirmation="1", liquidity_score="1",
+        ),
+        trusted_score_source="alphadesk_connected_opportunity",
+        trusted_score_observed_at=request.market_evidence_at,
+        trusted_signal_direction="BULLISH",
+        now=request.market_evidence_at,
+    )
+    assert result.decision == "FAIL"
+    assert "strategy_shape" in result.failed_check_codes
+
+
+def test_future_market_and_leg_quotes_are_unavailable() -> None:
+    now = datetime.now(UTC)
+    request = payload(
+        scope="SIGNAL_QUALITY",
+        external_account_id="declared-paper",
+        external_sandbox_id="declared-sandbox",
+        external_environment="PAPER",
+        market_evidence_at=now + timedelta(seconds=1),
+        legs=tuple(
+            leg.model_copy(update={"quoted_at": now + timedelta(seconds=1)})
+            for leg in payload().legs
+        ),
+    )
+    result = assess_strategy(request, AssessmentPolicy(), paper_equity=Decimal("10000"), now=now)
+    assert result.decision == "UNAVAILABLE"
+    assert "evidence_fresh" in result.failed_check_codes
+    assert "leg_0_quote_fresh" in result.failed_check_codes
+
+
+def test_stale_leg_quote_without_stale_market_evidence_is_unavailable() -> None:
+    now = datetime.now(UTC)
+    request = payload(
+        scope="SIGNAL_QUALITY",
+        external_account_id="declared-paper",
+        external_sandbox_id="declared-sandbox",
+        external_environment="PAPER",
+        legs=tuple(
+            leg.model_copy(update={"quoted_at": now - timedelta(hours=1)})
+            for leg in payload().legs
+        ),
+    )
+    result = assess_strategy(request, AssessmentPolicy(), paper_equity=Decimal("10000"), now=now)
+    assert result.decision == "UNAVAILABLE"
+    assert "leg_0_quote_fresh" in result.failed_check_codes
+
+    native_result = assess_strategy(
+        payload(
+            market_evidence_at=now,
+            legs=tuple(
+                leg.model_copy(update={"quoted_at": now - timedelta(hours=1)})
+                for leg in payload().legs
+            ),
+        ),
+        AssessmentPolicy(),
+        paper_equity=Decimal("10000"),
+        now=now,
+    )
+    assert native_result.decision == "PASS"
+    assert "leg_0_quote_fresh" not in native_result.failed_check_codes

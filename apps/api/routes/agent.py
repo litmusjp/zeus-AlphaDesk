@@ -23,8 +23,9 @@ from packages.connected.strategy_assessment import (
 from packages.database.models import AgentAPIKeyRecord, ConnectedOpportunityRecord, WorkspaceRecord
 from packages.domain.broker import BrokerAccount, BrokerSyncStatus
 from packages.domain.system import BrokerState
-from packages.domain.workflow import CatalystFeatures, Signal
+from packages.domain.workflow import CatalystFeatures, NoTrade, Signal, TradeIdea
 from packages.security.agent_keys import generate_agent_key, hash_agent_key, key_prefix
+from packages.strategy.catalyst import CatalystMomentumStrategy, score_signal
 
 router = APIRouter(prefix="/desk", tags=["agent-integrations"])
 
@@ -222,7 +223,7 @@ async def strategy_assessment(
             request.app.state, "external_account_provider", None
         )
         external_evidence = None
-        if provider is not None:
+        if payload.scope != "SIGNAL_QUALITY" and provider is not None:
             try:
                 candidate = await provider.get_account(
                     workspace_id=key.workspace_id,
@@ -247,7 +248,8 @@ async def strategy_assessment(
                 external_evidence = None
         trusted_features: CatalystFeatures | None = None
         trusted_observed_at: datetime | None = None
-        if external_evidence is not None:
+        trusted_signal_direction: str | None = None
+        if payload.scope == "SIGNAL_QUALITY" or external_evidence is not None:
             now = datetime.now(UTC)
             try:
                 async with database.sessions() as session:
@@ -262,23 +264,66 @@ async def strategy_assessment(
                         )
                         .order_by(ConnectedOpportunityRecord.observed_at.desc())
                     )
-                if opportunity is not None:
+                if (
+                    opportunity is not None
+                    and now >= opportunity.observed_at
+                    and now < opportunity.expires_at
+                    and getattr(opportunity, "source", None) == "ALPACA_REAL"
+                    and getattr(opportunity, "symbol", None) == payload.underlying_symbol.upper()
+                    and getattr(opportunity, "state", None) in {
+                        "NO_TRADE", "TRADE", "PRE_SCAN_CANDIDATE", "RESEARCH_CANDIDATE",
+                    }
+                ):
                     raw_signal = opportunity.payload.get("signal", {})
                     signal = Signal.model_validate(raw_signal)
+                    signal_features = CatalystFeatures.model_validate(signal.features)
                     signal_age = now - signal.observed_at
                     if (
                         signal.symbol == payload.underlying_symbol.upper()
                         and signal.source_versions
                         and signal.observed_at == opportunity.observed_at
+                        and (
+                            payload.scope != "SIGNAL_QUALITY"
+                            or signal.score == score_signal(signal_features)
+                        )
                         and timedelta(0) <= signal_age <= timedelta(
                             seconds=policy.execution_max_quote_age_seconds
                         )
                     ):
-                        trusted_features = CatalystFeatures.model_validate(signal.features)
+                        if payload.scope == "SIGNAL_QUALITY":
+                            evaluated = CatalystMomentumStrategy(
+                                minimum_score=policy.minimum_signal_score,
+                                maximum_gap=policy.maximum_gap_percent,
+                                minimum_catalyst_confidence=policy.minimum_catalyst_confidence,
+                            ).evaluate_signal(signal)
+                            if isinstance(evaluated, NoTrade):
+                                if opportunity.state != "NO_TRADE":
+                                    raise ValueError(
+                                        "opportunity state does not match evaluated signal"
+                                    )
+                                trusted_signal_direction = "NO_TRADE"
+                            else:
+                                if opportunity.state == "NO_TRADE":
+                                    raise ValueError("trade signal cannot have NO_TRADE state")
+                                idea = TradeIdea.model_validate(
+                                    opportunity.payload.get("trade_idea")
+                                )
+                                if (
+                                    idea.signal_id != signal.signal_id
+                                    or idea.signal_id != evaluated.signal_id
+                                    or idea.symbol != payload.underlying_symbol.upper()
+                                    or idea.direction != evaluated.direction
+                                ):
+                                    raise ValueError(
+                                        "signal trade idea does not match evaluated signal"
+                                    )
+                                trusted_signal_direction = idea.direction.value
+                        trusted_features = signal_features
                         trusted_observed_at = signal.observed_at
             except Exception:
                 trusted_features = None
                 trusted_observed_at = None
+                trusted_signal_direction = None
         return assess_strategy(
             payload,
             policy,
@@ -290,6 +335,7 @@ async def strategy_assessment(
                 "alphadesk_connected_opportunity" if trusted_features is not None else None
             ),
             trusted_score_observed_at=trusted_observed_at,
+            trusted_signal_direction=trusted_signal_direction,
         )
     projections = PostgresBrokerProjectionStore(database.sessions, key.workspace_id)
     status = await projections.get_status()
