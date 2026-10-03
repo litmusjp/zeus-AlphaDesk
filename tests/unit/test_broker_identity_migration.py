@@ -1,6 +1,12 @@
 import importlib.util
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 
 from packages.broker.projections import MemoryBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
@@ -152,20 +158,162 @@ def test_provenance_migration_adds_nullable_timestamps_after_0017() -> None:
     assert "UPDATE broker_orders" not in source
 
 
-def test_provenance_migration_downgrade_preserves_columns_and_nulls() -> None:
-    source = PROVENANCE_MIGRATION.read_text(encoding="utf-8")
+def _provenance_migration():
     spec = importlib.util.spec_from_file_location(
         "broker_identity_provenance", PROVENANCE_MIGRATION
     )
     assert spec is not None and spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
+    return migration
 
-    migration.downgrade()
 
-    downgrade_source = source[source.index("def downgrade()") :]
-    assert "op.drop_column" not in downgrade_source
-    assert "op.drop_index" not in downgrade_source
-    assert "raise" not in downgrade_source
-    assert "identity_validated_at" in downgrade_source
-    assert "NULL" in downgrade_source
+def test_provenance_migration_downgrade_preserves_null_and_timestamp() -> None:
+    migration = _provenance_migration()
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        for table in ("broker_positions", "broker_orders"):
+            connection.execute(sa.text(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)"))
+
+        operations = Operations(MigrationContext.configure(connection))
+        with patch.object(migration, "op", operations):
+            migration.upgrade()
+            for table in ("broker_positions", "broker_orders"):
+                connection.execute(
+                    sa.text(f"INSERT INTO {table} (id, identity_validated_at) VALUES (1, NULL)")
+                )
+                connection.execute(
+                    sa.text(
+                        f"INSERT INTO {table} (id, identity_validated_at) "
+                        "VALUES (2, '2026-09-20 14:00:00')"
+                    )
+                )
+
+            migration.downgrade()
+            for table in ("broker_positions", "broker_orders"):
+                inspector = sa.inspect(connection)
+                assert "identity_validated_at" in {
+                    column["name"] for column in inspector.get_columns(table)
+                }
+                assert f"ix_{table}_identity_validated_at" in {
+                    index["name"] for index in inspector.get_indexes(table)
+                }
+                assert connection.execute(
+                    sa.text(f"SELECT identity_validated_at FROM {table} ORDER BY id")
+                ).scalars().all() == [None, "2026-09-20 14:00:00"]
+
+
+def test_provenance_migration_reentrant_and_repairs_missing_index() -> None:
+    migration = _provenance_migration()
+    inspector = Mock()
+    inspector.get_columns.return_value = [
+        {"name": "identity_validated_at", "type": sa.DateTime(timezone=True), "nullable": True}
+    ]
+    inspector.get_indexes.return_value = [
+        {
+            "name": "ix_broker_positions_identity_validated_at",
+            "column_names": ["identity_validated_at"],
+            "unique": False,
+            "dialect_options": {"postgresql_include": []},
+        }
+    ]
+    operation = Mock()
+    with (
+        patch.object(migration, "op", operation),
+        patch.object(migration.sa, "inspect", return_value=inspector),
+    ):
+        migration.upgrade()
+
+    operation.add_column.assert_not_called()
+    operation.create_index.assert_called_once_with(
+        "ix_broker_orders_identity_validated_at", "broker_orders", ["identity_validated_at"]
+    )
+
+
+def test_provenance_migration_reupgrade_is_noop() -> None:
+    migration = _provenance_migration()
+    inspector = Mock()
+    inspector.get_columns.return_value = [
+        {"name": "identity_validated_at", "type": sa.DateTime(timezone=True), "nullable": True}
+    ]
+    inspector.get_indexes.side_effect = lambda table: [
+        {
+            "name": f"ix_{table}_identity_validated_at",
+            "column_names": ["identity_validated_at"],
+            "unique": False,
+            "dialect_options": {"postgresql_include": []},
+        }
+    ]
+    operation = Mock()
+    with (
+        patch.object(migration, "op", operation),
+        patch.object(migration.sa, "inspect", return_value=inspector),
+    ):
+        migration.upgrade()
+
+    operation.add_column.assert_not_called()
+    operation.create_index.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        {"type": sa.DateTime(timezone=False), "nullable": True},
+        {"type": sa.Integer(), "nullable": True},
+        {"type": sa.DateTime(timezone=True), "nullable": False},
+        {"type": sa.DateTime(timezone=True), "nullable": True, "default": "now()"},
+    ],
+)
+def test_provenance_migration_rejects_incompatible_column(column: dict) -> None:
+    migration = _provenance_migration()
+    inspector = Mock()
+    inspector.get_columns.return_value = [{"name": "identity_validated_at", **column}]
+    operation = Mock()
+    with (
+        patch.object(migration, "op", operation),
+        patch.object(migration.sa, "inspect", return_value=inspector),
+    ):
+        with pytest.raises(ValueError, match=r"broker_positions\.identity_validated_at"):
+            migration.upgrade()
+
+    operation.add_column.assert_not_called()
+    operation.create_index.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        {"column_names": ["id"], "unique": False},
+        {"column_names": ["identity_validated_at"], "unique": True},
+        {
+            "column_names": ["identity_validated_at"],
+            "unique": False,
+            "dialect_options": {"postgresql_where": "id > 0"},
+        },
+        {
+            "column_names": ["identity_validated_at"],
+            "unique": False,
+            "column_sorting": {"identity_validated_at": ("desc",)},
+        },
+    ],
+)
+def test_provenance_migration_rejects_incompatible_index(index: dict) -> None:
+    migration = _provenance_migration()
+    inspector = Mock()
+    inspector.get_columns.return_value = [
+        {"name": "identity_validated_at", "type": sa.DateTime(timezone=True), "nullable": True}
+    ]
+    inspector.get_indexes.return_value = [
+        {"name": "ix_broker_positions_identity_validated_at", **index}
+    ]
+    operation = Mock()
+    with (
+        patch.object(migration, "op", operation),
+        patch.object(migration.sa, "inspect", return_value=inspector),
+    ):
+        with pytest.raises(ValueError, match="ix_broker_positions_identity_validated_at"):
+            migration.upgrade()
+
+    operation.add_column.assert_not_called()
+    operation.create_index.assert_not_called()

@@ -16,12 +16,43 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
     for table in ("broker_positions", "broker_orders"):
-        op.add_column(
-            table,
-            sa.Column("identity_validated_at", sa.DateTime(timezone=True), nullable=True),
+        column = next(
+            (
+                item
+                for item in inspector.get_columns(table)
+                if item["name"] == "identity_validated_at"
+            ),
+            None,
         )
-        op.create_index(f"ix_{table}_identity_validated_at", table, ["identity_validated_at"])
+        if column is None:
+            op.add_column(
+                table,
+                sa.Column("identity_validated_at", sa.DateTime(timezone=True), nullable=True),
+            )
+        elif not (
+            isinstance(column["type"], sa.DateTime)
+            and column["type"].timezone is True
+            and column["nullable"] is True
+            and column.get("default") is None
+        ):
+            raise ValueError(f"{table}.identity_validated_at has an incompatible schema")
+
+        index_name = f"ix_{table}_identity_validated_at"
+        index = next(
+            (item for item in inspector.get_indexes(table) if item["name"] == index_name),
+            None,
+        )
+        if index is None:
+            op.create_index(index_name, table, ["identity_validated_at"])
+        elif not (
+            index["column_names"] == ["identity_validated_at"]
+            and index["unique"] in (False, 0)
+            and not any(index.get("dialect_options", {}).values())
+            and not index.get("column_sorting")
+        ):
+            raise ValueError(f"{index_name} has an incompatible schema")
 
 
 def downgrade() -> None:
