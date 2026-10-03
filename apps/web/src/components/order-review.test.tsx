@@ -15,6 +15,23 @@ const opportunity = {
 };
 
 describe("OrderReview exit plan", () => {
+  it("keeps the immutable review visible when exit calendar evidence is unavailable", async () => {
+    deskFetch.mockReset();
+    deskFetch.mockImplementation((path: string) => {
+      if (path === "/desk/opportunities/opportunity-1") return Promise.resolve(opportunity);
+      if (path === "/desk/approvals") return Promise.resolve([]);
+      if (path === "/desk/workspace") return Promise.resolve({ trading_environment: "PAPER" });
+      if (path === "/desk/next-session-exit") return Promise.reject(new Error("Calendar request failed"));
+      throw new Error(`Unexpected path: ${path}`);
+    });
+    render(<OrderReview id="opportunity-1" />);
+    expect(await screen.findByText(/AAPL.*DEBIT VERTICAL/)).toBeInTheDocument();
+    expect(screen.getByText("Calendar request failed")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Time-based exit"), { target: { value: "2026-09-28T15:55" } });
+    expect(screen.getByRole("button", { name: "Approve for next U.S. session" })).toBeDisabled();
+    expect(deskFetch.mock.calls.every(([, request]) => (request as RequestInit | undefined)?.method !== "POST")).toBe(true);
+  });
+
   it("loads the exchange-session recommendation and posts it as an instant", async () => {
     deskFetch.mockReset();
     deskFetch.mockResolvedValueOnce(opportunity).mockResolvedValueOnce([]).mockResolvedValueOnce({ trading_environment: "PAPER" }).mockResolvedValueOnce({ available: true, session_date: "2026-09-28", session_open: "2026-09-28T13:30:00Z", session_close: "2026-09-28T20:00:00Z", recommended_exit_at: "2026-09-28T19:55:00Z", timezone: "America/New_York", unavailable_reason: null }).mockResolvedValueOnce({ approval_id: "approval-1", opportunity_id: "opportunity-1", state: "APPROVED_FOR_SESSION", exit_plan: null });

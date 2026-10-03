@@ -57,7 +57,10 @@ export function OrderReview({ id }: { id: string }) {
       deskFetch<Analysis>(`/desk/opportunities/${id}`),
       deskFetch<ConditionalApproval[]>("/desk/approvals"),
       deskFetch<Workspace>("/desk/workspace"),
-      deskFetch<NextSessionExit>("/desk/next-session-exit"),
+      deskFetch<NextSessionExit>("/desk/next-session-exit").catch((error: Error) => {
+        setMessage(error.message);
+        return null;
+      }),
     ]);
     setOpportunity(nextOpportunity);
     setApproval(approvals.find((item) => item.opportunity_id === id) ?? null);
@@ -65,7 +68,7 @@ export function OrderReview({ id }: { id: string }) {
     setNextSessionExit(nextExit);
     if (nextOpportunity.candidate?.structure?.max_loss) setStopLoss((current) => current || nextOpportunity.candidate!.structure!.max_loss!);
     if (nextOpportunity.candidate?.structure?.max_profit) setProfitTarget((current) => current || nextOpportunity.candidate!.structure!.max_profit!);
-    if (nextExit.available && nextExit.recommended_exit_at) setExitExpiry((current) => current || exchangeDateTimeLocal(nextExit.recommended_exit_at!, nextExit.timezone));
+    if (nextExit?.available && nextExit.recommended_exit_at) setExitExpiry((current) => current || exchangeDateTimeLocal(nextExit.recommended_exit_at!, nextExit.timezone));
   }, [id]);
 
   useEffect(() => {
@@ -91,7 +94,7 @@ export function OrderReview({ id }: { id: string }) {
   const checks = opportunity.risk_decision?.checks ?? [];
   const recommendedQuantity = intent?.quantity ?? structure?.quantity;
   const recommendedLimit = intent?.limit_price ?? structure?.net_premium_per_share;
-  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure) && recommendedQuantity !== undefined && recommendedLimit !== undefined && Boolean(stopLoss) && Boolean(exitExpiry);
+  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure) && recommendedQuantity !== undefined && recommendedLimit !== undefined && Boolean(stopLoss) && Boolean(exitExpiry) && nextSessionExit?.available === true;
   const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state) || (approval.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() <= now.getTime());
   const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() > now.getTime();
 

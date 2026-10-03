@@ -92,7 +92,7 @@ export function MarketScanner() {
     async function initialize() {
       const initialWatchlistEpoch = watchlistMutationEpoch.current;
       const watchlistRequest = deskFetch<string[]>("/desk/watchlist");
-      const ancillaryRequests = Promise.all([
+      const ancillaryRequests = Promise.allSettled([
         deskFetch<Workspace>("/desk/workspace"),
         deskFetch<ScanRun[]>("/desk/scanner/runs"),
         deskFetch<MarketClock>("/desk/market-clock"),
@@ -111,14 +111,16 @@ export function MarketScanner() {
       try {
         const [space, scanRuns, marketClock] = await ancillaryRequests;
         if (!active) return;
-        setWorkspace(space);
-        setRuns(scanRuns);
-        setClock(marketClock);
-        if (scanRuns[0]) {
-          const latest = await deskFetch<Analysis[]>(`/desk/scanner/runs/${scanRuns[0].scan_run_id}`);
+        if (space.status === "fulfilled") setWorkspace(space.value);
+        if (scanRuns.status === "fulfilled") setRuns(scanRuns.value);
+        if (marketClock.status === "fulfilled") setClock(marketClock.value);
+        const failure = [space, scanRuns, marketClock].find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") setMessage(failure.reason instanceof Error ? failure.reason.message : "Scanner unavailable");
+        if (scanRuns.status === "fulfilled" && scanRuns.value[0]) {
+          const latest = await deskFetch<Analysis[]>(`/desk/scanner/runs/${scanRuns.value[0].scan_run_id}`);
           if (active) {
             setResults(latest);
-            setSelectedRunId(scanRuns[0].scan_run_id);
+            setSelectedRunId(scanRuns.value[0].scan_run_id);
           }
         }
       } catch (error) {
