@@ -16,6 +16,9 @@ import httpx
 from packages.domain.options import Greeks, OptionContract, OptionQuote
 from packages.domain.workflow import CatalystFeatures
 
+_HISTORICAL_SESSION_COUNT = 24
+_HISTORICAL_LOOKBACK_DAYS = 60
+
 
 class EvidenceUnavailable(Exception):
     def __init__(self, code: str = "market_data_unavailable"):
@@ -93,8 +96,8 @@ def features_from_observations(
         ):
             raise EvidenceUnavailable("stale_constituent_evidence")
     bar_dates = [session_date(bar["t"]) for bar in bars]
-    expected_dates = [day for day in prior_sessions if day >= session - timedelta(days=35)][-24:]
-    if len(expected_dates) != 24:
+    expected_dates = prior_sessions[-_HISTORICAL_SESSION_COUNT:]
+    if len(expected_dates) != _HISTORICAL_SESSION_COUNT:
         raise EvidenceUnavailable("historical_market_calendar_incomplete")
     historical_dates = sorted(day for day in bar_dates if day < session)
     if (
@@ -226,8 +229,15 @@ class DirectEvidenceProvider:
 
     async def _fetch(self, symbols: tuple[str, ...]) -> TradeEvidence:
         underlying = symbols[0][:-15]
-        start = (datetime.now(UTC) - timedelta(days=35)).isoformat()
-        end = datetime.now(UTC).isoformat()
+        now = datetime.now(UTC)
+        market_zone = ZoneInfo("America/New_York")
+        session = now.astimezone(market_zone).date()
+        session_start = datetime.combine(session, datetime.min.time(), market_zone)
+        start = datetime.combine(
+            session - timedelta(days=_HISTORICAL_LOOKBACK_DAYS), datetime.min.time(), market_zone
+        ).isoformat()
+        # Alpaca treats the end as inclusive, so midnight itself can include today's bar.
+        historical_end = (session_start - timedelta(microseconds=1)).isoformat()
         async with httpx.AsyncClient(
             headers=self._headers, timeout=2, follow_redirects=False, transport=self._transport
         ) as client:
@@ -250,8 +260,8 @@ class DirectEvidenceProvider:
                         "symbols": underlying,
                         "timeframe": "1Day",
                         "start": start,
-                        "end": end,
-                        "limit": 25,
+                        "end": historical_end,
+                        "limit": _HISTORICAL_SESSION_COUNT,
                         "sort": "desc",
                         "feed": "iex",
                     },
@@ -260,8 +270,8 @@ class DirectEvidenceProvider:
                     "https://data.alpaca.markets/v1beta1/news",
                     {
                         "symbols": underlying,
-                        "start": (datetime.now(UTC) - timedelta(hours=36)).isoformat(),
-                        "end": end,
+                        "start": (now - timedelta(hours=36)).isoformat(),
+                        "end": now.isoformat(),
                         "limit": 20,
                         "include_content": "false",
                     },
@@ -273,8 +283,8 @@ class DirectEvidenceProvider:
                 get(
                     "https://paper-api.alpaca.markets/v2/calendar",
                     {
-                        "start": (datetime.now(UTC) - timedelta(days=35)).date().isoformat(),
-                        "end": datetime.now(UTC).date().isoformat(),
+                        "start": (session - timedelta(days=_HISTORICAL_LOOKBACK_DAYS)).isoformat(),
+                        "end": session.isoformat(),
                     },
                 ),
                 *(

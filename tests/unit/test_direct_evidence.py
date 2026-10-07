@@ -6,6 +6,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
+import packages.connected.direct_evidence as direct_evidence
 from packages.connected.direct_evidence import (
     DirectEvidenceProvider,
     EvidenceUnavailable,
@@ -33,7 +34,9 @@ def test_historical_volume_requires_the_complete_requested_session_window():
         )
 
 
-@pytest.mark.parametrize("mutation", ["omitted", "duplicate", "future", "invalid_time", "valid"])
+@pytest.mark.parametrize(
+    "mutation", ["omitted", "duplicate", "current", "future", "invalid_time", "valid"]
+)
 def test_calendar_coverage_accepts_only_24_completed_provider_sessions(mutation):
     now = datetime(2026, 2, 3, 15, tzinfo=UTC)
     from datetime import date
@@ -55,6 +58,8 @@ def test_calendar_coverage_accepts_only_24_completed_provider_sessions(mutation)
         bars[4] = dict(bars[3])
     elif mutation == "future":
         bars.append({"v": 1000, "t": (now + timedelta(days=1)).isoformat()})
+    elif mutation == "current":
+        bars.append({"v": 1000, "t": now.isoformat()})
     elif mutation == "invalid_time":
         bars[0]["t"] = "not-a-timestamp"
     bars.reverse()
@@ -94,8 +99,23 @@ def test_calendar_coverage_accepts_only_24_completed_provider_sessions(mutation)
         "zero_price",
     ],
 )
-async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded_cache(invalid):
-    now = datetime.now(UTC)
+@pytest.mark.parametrize(
+    "now,holidays",
+    [
+        (datetime(2026, 8, 28, 16, tzinfo=UTC), set()),
+        (datetime(2026, 1, 26, 16, tzinfo=UTC), {"2025-12-25", "2026-01-01", "2026-01-19"}),
+    ],
+)
+async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded_cache(
+    invalid, now, holidays, monkeypatch
+):
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(direct_evidence, "datetime", FrozenDateTime)
     expiry = now + timedelta(days=30)
     symbol = f"AAPL{expiry.strftime('%y%m%d')}C00200000"
     seen = []
@@ -106,10 +126,21 @@ async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded
         seen.append(request.url.path)
         await asyncio.sleep(0.01)
         path = request.url.path
+        from zoneinfo import ZoneInfo
+
+        market_day = now.astimezone(ZoneInfo("America/New_York")).date()
+        previous_session = market_day - timedelta(days=1)
+        while previous_session.weekday() >= 5 or previous_session.isoformat() in holidays:
+            previous_session -= timedelta(days=1)
         stock = {
             "latestTrade": {"p": 205, "t": now.isoformat()},
             "dailyBar": {"o": 200, "v": 3000, "t": now.isoformat()},
-            "prevDailyBar": {"c": 200, "t": (now - timedelta(days=1)).isoformat()},
+            "prevDailyBar": {
+                "c": 200,
+                "t": datetime.combine(
+                    previous_session, datetime.min.time(), ZoneInfo("America/New_York")
+                ).isoformat(),
+            },
         }
         if invalid == "bad_intraday_volume":
             stock["dailyBar"]["v"] = -1
@@ -122,20 +153,30 @@ async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded
         elif path.endswith("/stocks/bars"):
             assert request.url.params["symbols"] == "AAPL"
             assert request.url.params["timeframe"] == "1Day"
-            assert request.url.params["limit"] == "25"
+            assert request.url.params["limit"] == "24"
             assert request.url.params["sort"] == "desc"
             assert request.url.params["feed"] == "iex"
-            assert (datetime.fromisoformat(request.url.params["end"])
-                    - datetime.fromisoformat(request.url.params["start"])).days >= 34
             from zoneinfo import ZoneInfo
 
+            market_zone = ZoneInfo("America/New_York")
             day = now.astimezone(ZoneInfo("America/New_York")).date()
+            assert (
+                request.url.params["start"]
+                == datetime.combine(
+                    day - timedelta(days=60), datetime.min.time(), market_zone
+                ).isoformat()
+            )
+            assert datetime.fromisoformat(request.url.params["end"]) < datetime.combine(
+                day, datetime.min.time(), market_zone
+            )
             prior = []
             cursor = day - timedelta(days=1)
-            while len(prior) < 24:
-                if cursor.weekday() < 5:
+            query_start = datetime.fromisoformat(request.url.params["start"]).date()
+            while cursor >= query_start:
+                if cursor.weekday() < 5 and cursor.isoformat() not in holidays:
                     prior.append(cursor)
                 cursor -= timedelta(days=1)
+            limit = int(request.url.params["limit"])
             result = {
                 "bars": {
                     "AAPL": [
@@ -145,13 +186,15 @@ async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded
                                 d, datetime.min.time(), ZoneInfo("America/New_York")
                             ).isoformat(),
                         }
-                        for d in reversed(prior)
+                        for d in prior[:limit]
                     ]
                 }
             }
             if invalid == "bad_bar_volume":
                 result["bars"]["AAPL"][0]["v"] = -1
         elif path.endswith("/news"):
+            assert request.url.params["start"] == (now - timedelta(hours=36)).isoformat()
+            assert request.url.params["end"] == now.isoformat()
             result = {
                 "news": [
                     {
@@ -168,8 +211,10 @@ async def test_parallel_get_only_market_evidence_preserves_times_and_has_bounded
             day = now.astimezone(ZoneInfo("America/New_York")).date()
             dates = [day]
             cursor = day - timedelta(days=1)
-            while len(dates) < 25:
-                if cursor.weekday() < 5:
+            assert request.url.params["start"] == (day - timedelta(days=60)).isoformat()
+            assert request.url.params["end"] == day.isoformat()
+            while cursor >= day - timedelta(days=60):
+                if cursor.weekday() < 5 and cursor.isoformat() not in holidays:
                     dates.append(cursor)
                 cursor -= timedelta(days=1)
             result = [{"date": item.isoformat()} for item in reversed(dates)]
