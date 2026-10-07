@@ -74,6 +74,16 @@ def test_assessment_reuses_policy_and_returns_stable_checks() -> None:
     assert result.execution_allowed is False
 
 
+def test_legacy_assessment_still_requires_open_interest_when_threshold_is_unset():
+    request = payload()
+    missing_oi_leg = request.legs[0].model_copy(update={"open_interest": None})
+    request = request.model_copy(update={"legs": (missing_oi_leg,)})
+    policy = AssessmentPolicy.model_construct(execution_min_open_interest=None)
+    result = assess_strategy(request, policy, paper_equity=Decimal("10000"))
+    liquidity = next(check for check in result.checks if check.code == "leg_0_liquidity")
+    assert liquidity.passed is False
+
+
 def test_signal_quality_scope_does_not_require_broker_equity() -> None:
     now = datetime.now(UTC)
     result = assess_strategy(

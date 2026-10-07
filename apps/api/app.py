@@ -132,6 +132,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(identity_router, prefix="/api/v1")
     application.include_router(admin_router, prefix="/api/v1")
     application.include_router(desk_router, prefix="/api/v1")
+    from apps.api.routes.assessment import router as assessment_router
+
+    application.include_router(assessment_router, prefix="/api/v2")
     application.include_router(agent_router, prefix="/api/v1")
     return application
 

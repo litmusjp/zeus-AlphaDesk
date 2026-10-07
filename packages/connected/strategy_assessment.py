@@ -130,8 +130,10 @@ def _check(code: str, passed: bool, actual: Any, limit: Any, reason: str) -> Ass
 _OCC_SYMBOL = re.compile(r"^(?P<root>[A-Z0-9]{1,6})(?P<date>\d{6})(?P<type>[CP])(?P<strike>\d{8})$")
 
 
-def _option_shape_check(request: StrategyAssessmentRequest) -> tuple[bool, str]:
-    if request.scope != "SIGNAL_QUALITY":
+def _option_shape_check(
+    request: StrategyAssessmentRequest, *, standalone: bool = False
+) -> tuple[bool, str]:
+    if request.scope != "SIGNAL_QUALITY" and not standalone:
         return (
             len(request.legs) in (2, 4),
             "Supported option strategy shape."
@@ -174,11 +176,13 @@ def _option_shape_check(request: StrategyAssessmentRequest) -> tuple[bool, str]:
     if type_a == "P" and long_strike <= short_strike:
         return False, "A put debit vertical requires the long strike above the short strike."
     strategy_type = request.strategy_type.upper()
-    strategy_matches_type = (
-        strategy_type != "BULL_CALL_DEBIT_SPREAD" or type_a == "C"
-    ) and (strategy_type != "BEAR_PUT_DEBIT_SPREAD" or type_a == "P")
+    strategy_matches_type = (strategy_type != "BULL_CALL_DEBIT_SPREAD" or type_a == "C") and (
+        strategy_type != "BEAR_PUT_DEBIT_SPREAD" or type_a == "P"
+    )
     return strategy_matches_type and strategy_type in {
-        "BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD", "DEBIT_VERTICAL",
+        "BULL_CALL_DEBIT_SPREAD",
+        "BEAR_PUT_DEBIT_SPREAD",
+        "DEBIT_VERTICAL",
     }, "Only a supported two-leg debit vertical is accepted."
 
 
@@ -194,11 +198,12 @@ def assess_strategy(
     trusted_score_source: str | None = None,
     trusted_score_observed_at: datetime | None = None,
     trusted_signal_direction: str | None = None,
+    standalone: bool = False,
 ) -> StrategyAssessmentResult:
     current = now or datetime.now(UTC)
     age = Decimal(str((current - request.market_evidence_at).total_seconds()))
     checks: list[AssessmentCheck] = []
-    shape_passed, shape_reason = _option_shape_check(request)
+    shape_passed, shape_reason = _option_shape_check(request, standalone=standalone)
     checks.append(
         _check(
             "strategy_shape",
@@ -226,9 +231,11 @@ def assess_strategy(
             "Quantity is within the workspace policy cap.",
         )
     )
-    signal_quality = request.scope == "SIGNAL_QUALITY"
+    signal_quality = request.scope == "SIGNAL_QUALITY" or standalone
     evidence_code = (
-        "signal_account_declaration"
+        "market_data_evidence"
+        if standalone
+        else "signal_account_declaration"
         if signal_quality
         else ("external_account_evidence" if request.is_external else "broker_evidence")
     )
@@ -239,7 +246,10 @@ def assess_strategy(
             True if signal_quality else broker_evidence_available,
             True,
             (
-                "Declared PAPER account and sandbox are client declarations; "
+                "Direct provider market evidence; "
+                "account authorization is the caller's responsibility."
+                if standalone
+                else "Declared PAPER account and sandbox are client declarations; "
                 "AlphaDesk did not independently verify them."
                 if signal_quality
                 else "Fresh independently established evidence for the requested "
@@ -283,15 +293,25 @@ def assess_strategy(
                 leg.ask >= leg.bid and spread <= policy.execution_max_spread_ratio,
                 spread,
                 policy.execution_max_spread_ratio,
-                "Caller-supplied quote evidence must be usable; AlphaDesk does not "
+                "Direct provider quote evidence must be usable."
+                if standalone
+                else "Caller-supplied quote evidence must be usable; AlphaDesk does not "
                 "independently verify it.",
             )
         )
         checks.append(
             _check(
                 f"leg_{index}_liquidity",
-                leg.open_interest is not None
-                and leg.open_interest >= policy.execution_min_open_interest
+                (
+                    (standalone and policy.execution_min_open_interest is None)
+                    or (
+                        leg.open_interest is not None
+                        and (
+                            policy.execution_min_open_interest is None
+                            or leg.open_interest >= policy.execution_min_open_interest
+                        )
+                    )
+                )
                 and leg.quote_size >= policy.minimum_quote_size,
                 {"open_interest": leg.open_interest, "quote_size": leg.quote_size},
                 {
@@ -352,37 +372,47 @@ def assess_strategy(
             )
         )
     score_features = (
-        trusted_market_features if request.is_external else request.market_scanner_features
+        trusted_market_features
+        if request.is_external or standalone
+        else request.market_scanner_features
     )
-    score_source = trusted_score_source if request.is_external else (
-        "caller_market_scanner_features" if request.market_scanner_features is not None else None
+    score_source = (
+        trusted_score_source
+        if request.is_external or standalone
+        else (
+            "caller_market_scanner_features"
+            if request.market_scanner_features is not None
+            else None
+        )
     )
-    score_observed_at = trusted_score_observed_at if request.is_external else (
-        request.market_evidence_at if request.market_scanner_features is not None else None
+    score_observed_at = (
+        trusted_score_observed_at
+        if request.is_external or standalone
+        else (request.market_evidence_at if request.market_scanner_features is not None else None)
     )
-    calculated_signal_score = (
-        score_signal(score_features) if score_features is not None else None
-    )
+    calculated_signal_score = score_signal(score_features) if score_features is not None else None
     market_scanner_signal_score = calculated_signal_score
-    if request.is_external:
+    if request.is_external or standalone:
         score_ready = (
             calculated_signal_score is not None
-            and score_source == "alphadesk_connected_opportunity"
+            and score_source
+            == ("alphadesk_direct_market_data" if standalone else "alphadesk_connected_opportunity")
             and (signal_quality or broker_evidence_available)
             and (signal_quality or (paper_equity is not None and paper_equity > 0))
             and score_observed_at is not None
             and current >= score_observed_at
-            and current - score_observed_at <= timedelta(
-                seconds=policy.execution_max_quote_age_seconds
-            )
+            and current - score_observed_at
+            <= timedelta(seconds=policy.execution_max_quote_age_seconds)
         )
         checks.append(
             _check(
-                "market_scanner_score_evidence",
+                "direct_signal_evidence" if standalone else "market_scanner_score_evidence",
                 score_ready,
                 calculated_signal_score if score_ready else None,
                 policy.minimum_signal_score,
-                "A fresh AlphaDesk-owned market signal is required for external assessment.",
+                "Fresh direct market evidence is required."
+                if standalone
+                else "A fresh AlphaDesk-owned market signal is required for external assessment.",
             )
         )
         if calculated_signal_score is not None and score_ready:
@@ -402,7 +432,8 @@ def assess_strategy(
         if signal_quality and trusted_signal_direction is not None:
             option_match = _OCC_SYMBOL.fullmatch(request.legs[0].symbol.upper())
             option_direction = (
-                "BULLISH" if option_match is not None and option_match.group("type") == "C"
+                "BULLISH"
+                if option_match is not None and option_match.group("type") == "C"
                 else "BEARISH"
             )
             checks.append(
@@ -421,13 +452,15 @@ def assess_strategy(
         else (
             "UNAVAILABLE"
             if any(
-                code in {
+                code
+                in {
                     "external_account_evidence",
                     "external_equity_evidence",
                     "broker_evidence",
                     "paper_equity",
                     "evidence_fresh",
                     "market_scanner_score_evidence",
+                    "direct_signal_evidence",
                 }
                 or code.endswith("_quote_fresh")
                 for code in failed

@@ -18,7 +18,8 @@ def _clamp(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
     return min(max(value, low), high)
 
 
-def score_signal(features: CatalystFeatures) -> Decimal:
+def score_components(features: CatalystFeatures) -> dict[str, Decimal]:
+    """Return the existing weighted catalyst/momentum score contributions."""
     direction = Decimal("1") if features.sentiment >= 0 else Decimal("-1")
     directional_momentum = _clamp(features.price_momentum * direction, Decimal("-1"), Decimal("1"))
     directional_market = _clamp(
@@ -30,14 +31,27 @@ def score_signal(features: CatalystFeatures) -> Decimal:
     volume = _clamp(
         (features.relative_volume - Decimal("1")) / Decimal("2"), Decimal("0"), Decimal("1")
     )
+    return {
+        "catalyst_confidence": features.catalyst_confidence * Decimal("0.30"),
+        "sentiment": abs(features.sentiment) * Decimal("0.15"),
+        "directional_momentum": ((directional_momentum + 1) / 2) * Decimal("0.20"),
+        "relative_volume": volume * Decimal("0.10"),
+        "market_confirmation": ((directional_market + 1) / 2) * Decimal("0.075"),
+        "sector_confirmation": ((directional_sector + 1) / 2) * Decimal("0.075"),
+        "liquidity": features.liquidity_score * Decimal("0.10"),
+    }
+
+
+def score_signal(features: CatalystFeatures) -> Decimal:
+    components = score_components(features)
     normalized = (
-        features.catalyst_confidence * Decimal("0.30")
-        + abs(features.sentiment) * Decimal("0.15")
-        + ((directional_momentum + 1) / 2) * Decimal("0.20")
-        + volume * Decimal("0.10")
-        + ((directional_market + 1) / 2) * Decimal("0.075")
-        + ((directional_sector + 1) / 2) * Decimal("0.075")
-        + features.liquidity_score * Decimal("0.10")
+        components["catalyst_confidence"]
+        + components["sentiment"]
+        + components["directional_momentum"]
+        + components["relative_volume"]
+        + components["market_confirmation"]
+        + components["sector_confirmation"]
+        + components["liquidity"]
     )
     return (normalized * Decimal("100")).quantize(Decimal("0.01"))
 

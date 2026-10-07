@@ -79,5 +79,72 @@ async def assess_options_strategy(strategy: dict[str, Any]) -> dict[str, Any]:
     return await call_assessment_api(strategy)
 
 
+async def call_trade_assessment_api(trade: dict[str, Any]) -> dict[str, Any]:
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    from packages.connected.trade_assessment import TradeRequest, validate_pass_receipt
+
+    proposal = TradeRequest.model_validate(trade)
+    base = os.environ.get("ALPHADESK_API_URL", "").rstrip("/")
+    key = os.environ.get("ALPHADESK_API_KEY", "")
+    url = urlsplit(base)
+    if (
+        not key
+        or url.username
+        or url.password
+        or not url.hostname
+        or (
+            url.scheme != "https"
+            and not (url.scheme == "http" and url.hostname in {"localhost", "127.0.0.1", "::1"})
+        )
+    ):
+        raise MCPAssessmentError("Assessment API configuration is missing or invalid")
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+            response = await client.post(
+                f"{base}/api/v2/option-trade-assessments",
+                headers={"X-AlphaDesk-API-Key": key},
+                json=proposal.model_dump(mode="json"),
+            )
+            response.raise_for_status()
+            if len(response.content) > 262144:
+                raise MCPAssessmentError("Assessment API returned an invalid response")
+            result = response.json()
+        if (
+            not isinstance(result, dict)
+            or result.get("decision") not in {"PASS", "FAIL", "UNAVAILABLE"}
+            or result.get("execution_allowed") is not False
+        ):
+            raise ValueError("invalid assessment")
+        if result["decision"] == "PASS":
+            if not result.get("assessment_id") or not validate_pass_receipt(result, proposal):
+                raise ValueError("invalid PASS")
+        return result
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, ArithmeticError) as exc:
+        raise MCPAssessmentError(
+            "Standalone assessment unavailable or invalid; do not execute this proposal"
+        ) from exc
+
+
+@mcp.tool()
+async def assess_options_trade(
+    legs: list[dict[str, Any]], quantity: int, limit_price: str, client_reference: str | None = None
+) -> dict[str, Any]:
+    """Assess your opening proposal without a scanner/watchlist. PASS is not broker authority;
+    FAIL/UNAVAILABLE: inspect checks/remediation, skip this proposal and continue other work.
+    Supported: long call/put or same-expiry 1:1 directional debit vertical. No orders or approvals.
+    """
+    return await call_trade_assessment_api(
+        {
+            "legs": legs,
+            "quantity": quantity,
+            "limit_price": limit_price,
+            "client_reference": client_reference,
+        }
+    )
+
+
 if __name__ == "__main__":
     mcp.run()

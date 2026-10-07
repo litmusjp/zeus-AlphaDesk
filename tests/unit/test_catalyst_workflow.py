@@ -37,7 +37,7 @@ from packages.execution.engine import (
 from packages.execution.intents import create_order_intent
 from packages.options.engine import build_structure
 from packages.risk.engine import RiskContext, RiskEngine, RiskPolicy
-from packages.strategy.catalyst import CatalystMomentumStrategy, score_signal
+from packages.strategy.catalyst import CatalystMomentumStrategy, score_components, score_signal
 
 
 def features(**updates: object) -> CatalystFeatures:
@@ -53,6 +53,34 @@ def features(**updates: object) -> CatalystFeatures:
     }
     values.update(updates)
     return CatalystFeatures(**values)
+
+
+@pytest.mark.parametrize(
+    "sentiment,volume,momentum",
+    [("0", "1", "-1"), ("-0.2", "5", "0.4567"), ("0.8", "3", "1")],
+)
+def test_extracted_score_components_preserve_original_decimal_formula(sentiment, volume, momentum):
+    sample = features(sentiment=sentiment, relative_volume=volume, price_momentum=momentum)
+    direction = Decimal("1") if sample.sentiment >= 0 else Decimal("-1")
+    def clamp(value, low, high):
+        return min(max(value, low), high)
+    d_momentum = clamp(sample.price_momentum * direction, Decimal("-1"), Decimal("1"))
+    d_market = clamp(sample.market_confirmation * direction, Decimal("-1"), Decimal("1"))
+    d_sector = clamp(sample.sector_confirmation * direction, Decimal("-1"), Decimal("1"))
+    volume_score = clamp(
+        (sample.relative_volume - Decimal("1")) / Decimal("2"), Decimal("0"), Decimal("1")
+    )
+    original = (
+        sample.catalyst_confidence * Decimal("0.30")
+        + abs(sample.sentiment) * Decimal("0.15")
+        + ((d_momentum + 1) / 2) * Decimal("0.20")
+        + volume_score * Decimal("0.10")
+        + ((d_market + 1) / 2) * Decimal("0.075")
+        + ((d_sector + 1) / 2) * Decimal("0.075")
+        + sample.liquidity_score * Decimal("0.10")
+    )
+    assert score_signal(sample) == (original * Decimal("100")).quantize(Decimal("0.01"))
+    assert sum(score_components(sample).values()) == original
 
 
 def signal_for(features_: CatalystFeatures) -> Signal:
