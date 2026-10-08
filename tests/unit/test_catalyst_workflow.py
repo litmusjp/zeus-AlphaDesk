@@ -169,6 +169,31 @@ def test_weak_or_extended_signal_deterministically_returns_no_trade() -> None:
     assert "weak_catalyst_confidence" in result.reason_codes
 
 
+def test_neutral_sentiment_uses_score_tie_break_for_direction_and_momentum() -> None:
+    strategy = CatalystMomentumStrategy()
+    rising = strategy.evaluate_signal(signal_for(features(sentiment="0", price_momentum="0.7")))
+    opposing = strategy.evaluate_signal(signal_for(features(sentiment="0", price_momentum="-0.7")))
+
+    assert not isinstance(rising, NoTrade)
+    assert rising.direction.value == "BULLISH"
+    assert isinstance(opposing, NoTrade)
+    assert "price_action_not_confirming" in opposing.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("sentiment", "momentum", "expected_direction"),
+    [("0.2", "0.7", "BULLISH"), ("-0.2", "-0.7", "BEARISH")],
+)
+def test_non_neutral_sentiment_direction_is_unchanged(
+    sentiment, momentum, expected_direction
+) -> None:
+    idea = CatalystMomentumStrategy().evaluate_signal(
+        signal_for(features(sentiment=sentiment, price_momentum=momentum))
+    )
+    assert not isinstance(idea, NoTrade)
+    assert idea.direction.value == expected_direction
+
+
 def test_risk_veto_cannot_create_order_intent() -> None:
     candidate, _, _ = approved_workflow()
     rejected = RiskEngine(RiskPolicy()).evaluate(

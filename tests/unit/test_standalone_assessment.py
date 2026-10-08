@@ -227,6 +227,25 @@ def test_bearish_signal_rejects_a_bullish_call():
     assert "signal_direction" in assess(ev=ev)["blocking_reasons"]
 
 
+def test_neutral_rising_signal_matches_bullish_score_tie_break_in_assessment():
+    ev = evidence()
+    ev = replace(
+        ev,
+        features=ev.features.model_copy(update={"sentiment": Decimal("0")}),
+    )
+
+    result = assess(ev=ev)
+
+    assert result["decision"] == "PASS", result
+    assert result["signal_score"] >= float(result["minimum_passing_score"])
+    assert "price_action_not_confirming" not in result["blocking_reasons"]
+    checks = {check["code"]: check for check in result["checks"]}
+    assert checks["signal_direction"]["passed"] is True
+    assert "price_action_not_confirming" not in checks
+    assert checks["evidence_fresh"]["passed"] is True
+    assert checks["policy_loss"]["passed"] is True
+
+
 def test_risk_budget_is_measured_on_proposed_debit_and_total_quantity():
     result = assess(proposal(quantity=10))
     assert result["decision"] == "FAIL"

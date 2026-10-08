@@ -74,7 +74,7 @@ class CatalystMomentumStrategy:
             reasons.append("score_below_threshold")
         if abs(signal.features.gap_percent) > self._maximum_gap:
             reasons.append("move_excessively_extended")
-        direction = Direction.BULLISH if signal.features.sentiment > 0 else Direction.BEARISH
+        direction = Direction.BULLISH if signal.features.sentiment >= 0 else Direction.BEARISH
         directional_momentum = signal.features.price_momentum * (
             Decimal("1") if direction is Direction.BULLISH else Decimal("-1")
         )
