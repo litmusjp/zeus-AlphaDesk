@@ -238,13 +238,14 @@ def test_external_trusted_score_enforces_threshold(
     from packages.domain.workflow import CatalystFeatures
     from tests.unit.test_strategy_assessment import payload
 
-    now = datetime.now(UTC)
+    request = payload(
+        external_account_id="L1",
+        external_sandbox_id="sandbox-1",
+        external_environment="PAPER",
+    )
+    now = request.observed_at
     result = assess_strategy(
-        payload(
-            external_account_id="L1",
-            external_sandbox_id="sandbox-1",
-            external_environment="PAPER",
-        ),
+        request,
         AssessmentPolicy(),
         paper_equity=Decimal("10000"),
         broker_evidence_available=True,
