@@ -16,12 +16,20 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
     for table in ("broker_positions", "broker_orders"):
-        op.add_column(
-            table,
-            sa.Column("identity_validated_at", sa.DateTime(timezone=True), nullable=True),
-        )
-        op.create_index(f"ix_{table}_identity_validated_at", table, ["identity_validated_at"])
+        columns = {column["name"] for column in inspector.get_columns(table)}
+        if "identity_validated_at" not in columns:
+            op.add_column(
+                table,
+                sa.Column("identity_validated_at", sa.DateTime(timezone=True), nullable=True),
+            )
+
+        index_name = f"ix_{table}_identity_validated_at"
+        indexes = {index["name"] for index in inspector.get_indexes(table)}
+        if index_name not in indexes:
+            op.create_index(index_name, table, ["identity_validated_at"])
 
 
 def downgrade() -> None:

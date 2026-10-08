@@ -169,3 +169,46 @@ def test_provenance_migration_downgrade_preserves_columns_and_nulls() -> None:
     assert "raise" not in downgrade_source
     assert "identity_validated_at" in downgrade_source
     assert "NULL" in downgrade_source
+
+
+def test_provenance_upgrade_adds_only_missing_columns_and_indexes(monkeypatch) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "broker_identity_provenance_partial", PROVENANCE_MIGRATION
+    )
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    existing = {
+        "broker_positions": {"columns": {"identity_validated_at"}, "indexes": set()},
+        "broker_orders": {"columns": set(), "indexes": {"ix_broker_orders_identity_validated_at"}},
+    }
+    added_columns = []
+    created_indexes = []
+
+    class Inspector:
+        def get_columns(self, table):
+            return [{"name": name} for name in existing[table]["columns"]]
+
+        def get_indexes(self, table):
+            return [{"name": name} for name in existing[table]["indexes"]]
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: object())
+    monkeypatch.setattr(migration.sa, "inspect", lambda _bind: Inspector())
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table, column: added_columns.append((table, column.name)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table, columns: created_indexes.append((name, table, columns)),
+    )
+
+    migration.upgrade()
+
+    assert added_columns == [("broker_orders", "identity_validated_at")]
+    assert created_indexes == [
+        ("ix_broker_positions_identity_validated_at", "broker_positions", ["identity_validated_at"])
+    ]

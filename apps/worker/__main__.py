@@ -299,9 +299,7 @@ async def _pre_session_supervisor(
                     continue
                 environment = TradingEnvironment(workspace.trading_environment)
                 provider = (
-                    "ALPACA_LIVE"
-                    if environment is TradingEnvironment.LIVE
-                    else "ALPACA_PAPER"
+                    "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
                 )
                 secret = await credential_store.reveal(workspace.workspace_id, provider)
                 if secret is None:
@@ -402,9 +400,7 @@ async def _scanner_supervisor(
                     continue
                 environment = TradingEnvironment(workspace.trading_environment)
                 provider = (
-                    "ALPACA_LIVE"
-                    if environment is TradingEnvironment.LIVE
-                    else "ALPACA_PAPER"
+                    "ALPACA_LIVE" if environment is TradingEnvironment.LIVE else "ALPACA_PAPER"
                 )
                 secret = await credential_store.reveal(workspace.workspace_id, provider)
                 if secret is None:

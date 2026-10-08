@@ -97,16 +97,12 @@ async def queue_triggered_exit_plans(
         assert isinstance(plan, dict)
         try:
             legs = (
-                opening.approved_intent_payload["legs"]
-                if opening.approved_intent_payload
-                else []
+                opening.approved_intent_payload["legs"] if opening.approved_intent_payload else []
             )
             if len(legs) != 1:
                 continue
             symbol = str(legs[0]["symbol"])
-            position = next(
-                (item for item in snapshot.positions if item.symbol == symbol), None
-            )
+            position = next((item for item in snapshot.positions if item.symbol == symbol), None)
             if position is None or position.asset_class.lower() != "us_option":
                 continue
             if position.quantity <= 0 or position.current_price is None:
@@ -176,9 +172,7 @@ async def queue_triggered_exit_plans(
                             else Decimal("0")
                         ),
                         min_limit_price=(
-                            position.current_price
-                            if order_side is ExitOrderSide.SELL
-                            else None
+                            position.current_price if order_side is ExitOrderSide.SELL else None
                         ),
                         max_loss=Decimal("0"),
                         max_quantity=int(position.quantity),

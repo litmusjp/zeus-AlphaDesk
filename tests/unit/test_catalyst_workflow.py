@@ -62,8 +62,10 @@ def features(**updates: object) -> CatalystFeatures:
 def test_extracted_score_components_preserve_original_decimal_formula(sentiment, volume, momentum):
     sample = features(sentiment=sentiment, relative_volume=volume, price_momentum=momentum)
     direction = Decimal("1") if sample.sentiment >= 0 else Decimal("-1")
+
     def clamp(value, low, high):
         return min(max(value, low), high)
+
     d_momentum = clamp(sample.price_momentum * direction, Decimal("-1"), Decimal("1"))
     d_market = clamp(sample.market_confirmation * direction, Decimal("-1"), Decimal("1"))
     d_sector = clamp(sample.sector_confirmation * direction, Decimal("-1"), Decimal("1"))
