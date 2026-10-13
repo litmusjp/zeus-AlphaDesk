@@ -492,13 +492,24 @@ def evaluate(
     checks = []
     for original in result.checks:
         c = original.model_dump(mode="json")
+        message = c["reason"]
+        if not c["passed"] and c["code"] == "policy_loss":
+            message = (
+                "Reduce the proposed debit or quantity until maximum planned loss is "
+                "within the workspace limit."
+            )
+        elif not c["passed"] and c["code"] == "minimum_signal_score":
+            message = (
+                "The trusted market signal does not meet the workspace minimum score; "
+                "wait for stronger verified evidence."
+            )
         checks.append(
             {
                 "code": c["code"],
                 "passed": c["passed"],
                 "actual": c["actual"],
                 "threshold": c["limit"],
-                "message": c["reason"],
+                "message": message,
             }
         )
 

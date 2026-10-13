@@ -38,6 +38,18 @@ def test_global_operator_credentials_are_ignored() -> None:
     assert not hasattr(settings, "openai_api_key")
 
 
+def test_standalone_minimum_signal_score_override_is_optional_and_bounded() -> None:
+    from decimal import Decimal
+
+    assert Settings(_env_file=None).standalone_minimum_signal_score is None
+    assert Settings(
+        _env_file=None, standalone_minimum_signal_score="25"
+    ).standalone_minimum_signal_score == Decimal("25")
+    for value in ("-0.1", "100.1", "NaN", "Infinity"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, standalone_minimum_signal_score=value)
+
+
 def test_global_ai_provider_must_remain_fixture() -> None:
     assert Settings(_env_file=None, llm_provider="fixture").llm_provider == "fixture"
     with pytest.raises(ValidationError, match="connected providers are BYOK"):

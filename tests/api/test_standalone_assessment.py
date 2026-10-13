@@ -22,9 +22,15 @@ class Session:
         raise AssertionError("Standalone assessment must never read scanner records")
 
 
-def client():
-    app = create_app(Settings(infrastructure_checks=False))
-    app.state.database = SimpleNamespace(sessions=Session)
+def client(settings=None, assessment_policy=None):
+    stored = assessment_policy if assessment_policy is not None else {}
+
+    class PolicySession(Session):
+        async def get(self, model, key):
+            return SimpleNamespace(assessment_policy=stored)
+
+    app = create_app(settings or Settings(infrastructure_checks=False))
+    app.state.database = SimpleNamespace(sessions=PolicySession)
     app.dependency_overrides[require_agent_key] = lambda: AgentKeyContext(
         workspace_id=uuid4(), key_id=uuid4()
     )
@@ -240,6 +246,115 @@ def test_policy_is_machine_readable_and_forbids_execution_authority():
     assert result["minimum_passing_score"]
     assert result["execution_allowed"] is False
     assert result["supported_strategies"]
+
+
+def test_standalone_score_override_is_route_scoped_and_policy_bound():
+    from datetime import UTC, datetime, timedelta
+    from decimal import Decimal
+
+    from packages.domain.options import Greeks, OptionContract, OptionQuote
+    from packages.domain.workflow import CatalystFeatures
+
+    stored_policy = {
+        "minimum_signal_score": "35",
+        "pre_scan_minimum_signal_score": "35",
+    }
+    settings = Settings(infrastructure_checks=False, standalone_minimum_signal_score="25")
+    c = client(settings, stored_policy)
+    policy_response = c.get("/api/v2/option-trade-assessments/policy").json()
+    assert policy_response["minimum_passing_score"] == "25"
+    assert policy_response["policy_snapshot"]["minimum_signal_score"] == "25"
+    default_policy_response = (
+        client(Settings(infrastructure_checks=False), stored_policy)
+        .get("/api/v2/option-trade-assessments/policy")
+        .json()
+    )
+    assert {
+        key: value
+        for key, value in policy_response["policy_snapshot"].items()
+        if key != "minimum_signal_score"
+    } == {
+        key: value
+        for key, value in default_policy_response["policy_snapshot"].items()
+        if key != "minimum_signal_score"
+    }
+
+    now = datetime.now(UTC)
+    evidence_age = timedelta(0)
+
+    class Provider:
+        async def get_evidence(self, proposal):
+            contract = OptionContract(
+                contract_id="route-override-fixture",
+                symbol=proposal.legs[0].symbol,
+                underlying_symbol="AAPL",
+                expiration=(now.date() + timedelta(days=30)),
+                strike=Decimal(200),
+                option_type="call",
+                multiplier=100,
+                tradable=True,
+                quote=OptionQuote(
+                    bid="1.95",
+                    ask="2.05",
+                    bid_size=10,
+                    ask_size=10,
+                    quoted_at=now - evidence_age,
+                    open_interest=1000,
+                    greeks=Greeks(delta=".5", gamma=".01", theta="-.01", vega=".1"),
+                ),
+            )
+            features = CatalystFeatures(
+                catalyst_confidence=".2",
+                sentiment=".5",
+                relative_volume="1.1",
+                price_momentum="-.2",
+                gap_percent="1",
+                market_confirmation="-.5",
+                sector_confirmation="-.5",
+                liquidity_score=".752",
+            )
+            return SimpleNamespace(
+                contracts=(contract,),
+                features=features,
+                features_at=now - evidence_age,
+                spot=Decimal(200),
+                greeks_at=now - evidence_age,
+                greeks_source="route-override-test",
+            )
+
+    c.app.state.trade_assessment_provider_factory = lambda key: Provider()
+    proposal = trade()
+    proposal["quantity"] = 10
+    response = c.post("/api/v2/option-trade-assessments", json=proposal)
+    result = response.json()
+    assert result["signal_score"] == 33.27
+    assert result["minimum_passing_score"] == "25"
+    assert result["policy_snapshot"]["minimum_signal_score"] == "25"
+    assert result["policy_version"] == policy_response["policy_version"]
+    score_check = next(
+        check for check in result["checks"] if check["code"] == "minimum_signal_score"
+    )
+    assert score_check["passed"] is True
+    check_codes = [check["code"] for check in result["checks"]]
+    assert check_codes.count("minimum_signal_score") == 1
+    assert "score_below_threshold" not in check_codes
+    assert "policy_loss" in result["blocking_reasons"]
+    assert "price_action_not_confirming" in result["blocking_reasons"]
+    assert stored_policy == {
+        "minimum_signal_score": "35",
+        "pre_scan_minimum_signal_score": "35",
+    }
+
+    evidence_age = timedelta(hours=1)
+    stale = c.post("/api/v2/option-trade-assessments", json=proposal).json()
+    assert stale["decision"] == "UNAVAILABLE"
+    assert "stale_or_invalid_evidence" in stale["blocking_reasons"]
+
+    default = client(Settings(infrastructure_checks=False), stored_policy)
+    default_policy = default.get("/api/v2/option-trade-assessments/policy").json()
+    assert default_policy["minimum_passing_score"] == "35"
+    assert default_policy["policy_version"] != policy_response["policy_version"]
+    assert default_policy["policy_snapshot"]["minimum_signal_score"] == "35"
 
 
 def test_provider_failure_returns_specific_unavailable_feedback():

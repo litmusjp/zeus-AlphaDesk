@@ -1,6 +1,7 @@
 # FastAPI dependencies are deliberately declared in defaults.
 # ruff: noqa: B008
 import asyncio
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -28,16 +29,24 @@ async def workspace_policy(request: Request, key: AgentKeyContext) -> Assessment
     return AssessmentPolicy.from_payload(workspace.assessment_policy)
 
 
+async def standalone_policy(request: Request, key: AgentKeyContext) -> AssessmentPolicy:
+    policy = await workspace_policy(request, key)
+    override = request.app.state.settings.standalone_minimum_signal_score
+    if override is not None:
+        return policy.model_copy(update={"minimum_signal_score": Decimal(override)})
+    return policy
+
+
 @router.get("/option-trade-assessments/policy")
 async def assessment_policy(request: Request, key: AgentKeyContext = Depends(require_agent_key)):
-    return policy_metadata(await workspace_policy(request, key))
+    return policy_metadata(await standalone_policy(request, key))
 
 
 @router.post("/option-trade-assessments")
 async def assess_option_trade(
     trade: TradeRequest, request: Request, key: AgentKeyContext = Depends(require_agent_key)
 ):
-    policy = await workspace_policy(request, key)
+    policy = await standalone_policy(request, key)
     if not supported_shape(trade):
         return evaluate(trade, policy, None)
     factory = getattr(request.app.state, "trade_assessment_provider_factory", None)

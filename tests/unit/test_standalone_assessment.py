@@ -253,6 +253,61 @@ def test_risk_budget_is_measured_on_proposed_debit_and_total_quantity():
     assert any(not c["passed"] and "loss" in c["code"] for c in result["checks"])
 
 
+@pytest.mark.parametrize(
+    ("trade", "policy", "check_code", "actual", "required"),
+    [
+        (
+            proposal(quantity=10, limit_price="2.49"),
+            AssessmentPolicy(max_investment_per_candidate=Decimal("1000")),
+            "policy_loss",
+            "2490",
+            "1000",
+        ),
+        (
+            proposal(),
+            AssessmentPolicy(
+                minimum_signal_score=Decimal("35"),
+                pre_scan_minimum_signal_score=Decimal("35"),
+            ),
+            "minimum_signal_score",
+            "33.27",
+            "35",
+        ),
+    ],
+)
+def test_failed_policy_check_remediation_explains_failure(
+    trade, policy, check_code, actual, required
+):
+    ev = evidence()
+    if check_code == "minimum_signal_score":
+        ev = replace(
+            ev,
+            features=ev.features.model_copy(
+                update={
+                    "catalyst_confidence": Decimal(".2"),
+                    "sentiment": Decimal(".5"),
+                    "relative_volume": Decimal("1.1"),
+                    "price_momentum": Decimal("-.2"),
+                    "market_confirmation": Decimal("-.5"),
+                    "sector_confirmation": Decimal("-.5"),
+                    "liquidity_score": Decimal(".752"),
+                }
+            ),
+        )
+    result = assess(trade=trade, policy=policy, ev=ev)
+    check = next(item for item in result["checks"] if item["code"] == check_code)
+    assert check["passed"] is False
+    assert actual in result["remediation"][result["blocking_reasons"].index(check_code)]
+    assert required in result["remediation"][result["blocking_reasons"].index(check_code)]
+    remediation = result["remediation"][result["blocking_reasons"].index(check_code)]
+    if check_code == "policy_loss":
+        assert "Reduce the proposed debit" in remediation
+        assert "Maximum loss is within" not in remediation
+    else:
+        assert "trusted market signal does not meet" in remediation
+        assert "trusted market signal meets" not in remediation
+
+
 def test_no_quote_depth_fails_without_inventing_a_size():
     result = assess(ev=alter_quote(evidence(), bid_size=0, ask_size=0))
     assert result["decision"] == "FAIL"

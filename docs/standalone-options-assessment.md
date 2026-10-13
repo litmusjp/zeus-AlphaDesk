@@ -17,6 +17,8 @@ Supported initially: a long call, long put, bull-call debit vertical or bear-put
 
 Get authenticated passing criteria with `GET /api/v2/option-trade-assessments/policy`.
 
+Operators may set `ALPHADESK_STANDALONE_MINIMUM_SIGNAL_SCORE` (finite decimal 0–100) to override only the standalone route's score threshold. When unset, each workspace's configured threshold applies. This setting does not change scanner or other assessment policy.
+
 ## Result and passing rules
 
 - **PASS:** genuine fresh evidence, existing catalyst/momentum score and direction, confidence/gap, quote/depth/spread/open-interest/Greeks, DTE/strike distance and proposed debit/quantity/loss caps meet the workspace policy.

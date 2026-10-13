@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 
@@ -75,6 +76,13 @@ class Settings(BaseSettings):
 
     workspace_connection_limit: int = Field(
         default=20, ge=1, le=100, validation_alias="ALPHADESK_WORKSPACE_CONNECTION_LIMIT"
+    )
+    standalone_minimum_signal_score: Decimal | None = Field(
+        default=None,
+        ge=Decimal("0"),
+        le=Decimal("100"),
+        allow_inf_nan=False,
+        validation_alias="ALPHADESK_STANDALONE_MINIMUM_SIGNAL_SCORE",
     )
 
     @field_validator("mode", mode="before")
