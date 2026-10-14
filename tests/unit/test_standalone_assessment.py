@@ -102,6 +102,23 @@ def test_pass_is_a_fresh_bound_assessment_never_order_authority():
     assert result["evidence_as_of"] == evidence().features_at.isoformat()
 
 
+def test_fastapi_serialized_pass_receipt_matches_shared_op2_golden(monkeypatch):
+    from dataclasses import replace
+    from pathlib import Path
+    from uuid import UUID
+
+    from fastapi.responses import JSONResponse
+    import packages.connected.trade_assessment as module
+
+    monkeypatch.setattr(module, "uuid4", lambda: UUID("888c17f7-e4af-408f-a8bb-50109488f262"))
+    trade = proposal(limit_price="1.84", client_reference="op2-receipt-wire-format")
+    unknown_greek_time = replace(evidence(), greeks_at=None, greeks_source=None)
+    policy = AssessmentPolicy(minimum_signal_score=Decimal("25"), pre_scan_minimum_signal_score=Decimal("20"))
+    actual = JSONResponse(content=assess(trade=trade, ev=unknown_greek_time, policy=policy)).body
+    golden = Path(__file__).parents[1] / "testdata" / "op2-pass-receipt.json"
+    assert actual == golden.read_bytes()
+
+
 def test_proposal_fingerprint_matches_go_contract_and_normalizes_default_ratio_and_decimal():
     canonical = TradeRequest.model_validate(
         {"legs": [{"symbol": SYMBOL, "side": "buy"}], "quantity": 1, "limit_price": "2"}

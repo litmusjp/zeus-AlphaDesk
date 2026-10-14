@@ -107,12 +107,24 @@ def features_from_observations(
         or any(day >= session for day in bar_dates)
     ):
         raise EvidenceUnavailable("stale_historical_evidence")
+    eligible_news = []
     for article in news:
-        published = timestamp(article.get("created_at"))
-        if not now - timedelta(hours=36) <= published <= now or underlying not in article.get(
-            "symbols", []
+        if not isinstance(article, dict):
+            continue
+        try:
+            published = timestamp(article.get("created_at"))
+        except EvidenceUnavailable:
+            continue
+        symbols = article.get("symbols")
+        headline = article.get("headline")
+        if (
+            now - timedelta(hours=36) <= published <= now
+            and isinstance(symbols, list)
+            and underlying in symbols
+            and isinstance(headline, str)
+            and headline.strip()
         ):
-            raise EvidenceUnavailable("invalid_news_evidence")
+            eligible_news.append(article)
     stock = stocks[underlying]
     price = number(stock["latestTrade"]["p"])
     previous = number(stock["prevDailyBar"]["c"])
@@ -150,7 +162,7 @@ def features_from_observations(
     catalyst = (
         positive | negative | {"earnings", "guidance", "merger", "acquisition", "contract", "fda"}
     )
-    words = " ".join(str(n["headline"]).lower() for n in news).split()
+    words = " ".join(str(n["headline"]).lower() for n in eligible_news).split()
     positives = sum(word.strip(".,:;!?()") in positive for word in words)
     negatives = sum(word.strip(".,:;!?()") in negative for word in words)
     total = positives + negatives
@@ -158,7 +170,7 @@ def features_from_observations(
     catalyst_hits = sum(word.strip(".,:;!?()") in catalyst for word in words)
     confidence = min(
         Decimal(".15")
-        + Decimal(len(news)) * Decimal(".06")
+        + Decimal(len(eligible_news)) * Decimal(".06")
         + Decimal(catalyst_hits) * Decimal(".08"),
         Decimal(1),
     )

@@ -34,6 +34,46 @@ def test_historical_volume_requires_the_complete_requested_session_window():
         )
 
 
+def test_news_eligibility_keeps_fresh_matching_articles_and_preserves_empty_news_policy():
+    now = datetime(2026, 10, 14, 15, tzinfo=UTC)
+    from datetime import date
+
+    expected = []
+    cursor = date(2026, 10, 13)
+    while len(expected) < 24:
+        if cursor.weekday() < 5 and cursor.isoformat() != "2026-10-12":
+            expected.append(cursor)
+        cursor -= timedelta(days=1)
+    expected.reverse()
+    bars = [{"v": 1000, "t": datetime.combine(d, datetime.min.time(), UTC).replace(hour=15).isoformat()} for d in expected]
+    prior = expected[-1]
+    snapshot = {
+        "latestTrade": {"p": 101, "t": now.isoformat()},
+        "dailyBar": {"o": 100, "v": 500, "t": now.isoformat()},
+        "prevDailyBar": {"c": 100, "t": datetime.combine(prior, datetime.min.time(), UTC).replace(hour=15).isoformat()},
+    }
+    calendar = [{"date": d.isoformat()} for d in expected] + [{"date": now.date().isoformat()}]
+    valid = {"created_at": (now - timedelta(minutes=2)).isoformat(), "symbols": ["AAPL"], "headline": "AAPL raises guidance"}
+    invalid = [
+        {"created_at": (now - timedelta(days=4)).isoformat(), "symbols": ["AAPL"], "headline": "old raises"},
+        {"created_at": (now + timedelta(minutes=1)).isoformat(), "symbols": ["AAPL"], "headline": "future raises"},
+        {"created_at": "bad timestamp", "symbols": ["AAPL"], "headline": "malformed raises"},
+        {"created_at": now.isoformat(), "symbols": ["MSFT"], "headline": "irrelevant raises"},
+        {"symbols": ["AAPL"], "headline": "missing timestamp raises"},
+        {"created_at": now.isoformat(), "symbols": None, "headline": "malformed symbols"},
+        {"created_at": now.isoformat(), "symbols": ["AAPL"]},
+    ]
+    args = ( {s: snapshot for s in ("AAPL", "SPY", "QQQ")}, bars, [*invalid, valid], "AAPL", Decimal("1") )
+    args = (args[0], args[1], [None, *args[2]], *args[3:])
+    features, _, _ = features_from_observations(*args, calendar=calendar, now=now)
+    assert features.catalyst_confidence == Decimal(".37")
+    empty_features, _, _ = features_from_observations(
+        *args[:2], invalid, "AAPL", Decimal("1"), calendar=calendar, now=now
+    )
+    assert empty_features.catalyst_confidence == Decimal(".15")
+    assert empty_features.sentiment == 0
+
+
 @pytest.mark.parametrize(
     "mutation", ["omitted", "duplicate", "current", "future", "invalid_time", "valid"]
 )
