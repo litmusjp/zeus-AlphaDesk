@@ -43,6 +43,7 @@ export function CredentialSettings() {
     event.preventDefault();
     setBusy(true);
     setMessage("");
+    const label = provider === "alpaca-paper" ? "Alpaca paper" : provider === "alpaca-live" ? "Alpaca live" : provider === "openrouter" ? "OpenRouter" : "Anthropic";
     try {
       const payload = provider === "alpaca-paper"
         ? { api_key_id: alpacaPaperKey, secret_key: alpacaPaperSecret }
@@ -66,10 +67,16 @@ export function CredentialSettings() {
         } else {
           setAnthropicKey("");
         }
-        await refresh();
+        try {
+          await refresh();
+          setMessage(`${label} verified and encrypted.`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "Status refresh failed";
+          setMessage(`${label} was saved, but status could not be refreshed: ${reason}`);
+        }
+      } else {
+        setMessage(`${label} validation passed.`);
       }
-      const label = provider === "alpaca-paper" ? "Alpaca paper" : provider === "alpaca-live" ? "Alpaca live" : provider === "openrouter" ? "OpenRouter" : "Anthropic";
-      setMessage(`${label} ${save ? "verified and encrypted" : "validation passed"}.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Validation failed");
     } finally {
@@ -83,8 +90,13 @@ export function CredentialSettings() {
     try {
       const credentialEndpoint = provider === "alpaca-paper" ? "alpaca" : provider;
       await deskFetch(`/desk/credentials/${credentialEndpoint}`, { method: "DELETE" });
-      await refresh();
-      setMessage("Credential removed and dependent access disabled.");
+      try {
+        await refresh();
+        setMessage("Credential removed and dependent access disabled.");
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "Status refresh failed";
+        setMessage(`Credential was removed, but status could not be refreshed: ${reason}`);
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Delete failed");
     } finally {
