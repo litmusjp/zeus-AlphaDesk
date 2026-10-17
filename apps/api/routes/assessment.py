@@ -166,9 +166,27 @@ async def assess_option_trade(
         return managed_assessment(
             unavailable(trade, policy, "human_approval_required"), gate, evaluated=False
         )
+
+    async def finalize(result, *, evaluated=True):
+        if gate is None:
+            return result
+        current_gate = await _managed_gate(request, key)
+        if current_gate is None:
+            value = managed_assessment(
+                unavailable(trade, policy, "managed_policy_unavailable"),
+                gate,
+                evaluated=False,
+            )
+            value["approval_gate"]["required"] = None
+            value["approval_gate"]["status"] = "unknown"
+            base_policy_version = result.get("policy_version", "")
+            value["policy_version"] = f"{base_policy_version}:managed:{gate.revision}:unknown"
+            return value
+        return managed_assessment(result, current_gate, evaluated=evaluated)
+
     if not supported_shape(trade):
         result = evaluate(trade, policy, None)
-        return managed_assessment(result, gate) if gate else result
+        return await finalize(result)
     factory = getattr(request.app.state, "trade_assessment_provider_factory", None)
 
     async def run():
@@ -211,17 +229,19 @@ async def assess_option_trade(
                     cache.pop(next(iter(cache)))
                 cache[cache_key] = provider
         evidence = await provider.get_evidence(trade)
-        result = evaluate(trade, policy, evidence)
-        return managed_assessment(result, gate) if gate else result
+        return evaluate(trade, policy, evidence)
 
     try:
-        return await asyncio.wait_for(run(), timeout=5)
+        result = await asyncio.wait_for(run(), timeout=5)
     except TimeoutError:
         result = unavailable(trade, policy, "assessment_deadline_exceeded")
-        return managed_assessment(result, gate, evaluated=False) if gate else result
+        evaluated = False
     except EvidenceUnavailable as exc:
         result = unavailable(trade, policy, exc.code)
-        return managed_assessment(result, gate, evaluated=False) if gate else result
+        evaluated = False
     except (ValueError, KeyError, TypeError, ArithmeticError):
         result = unavailable(trade, policy, "invalid_market_evidence")
-        return managed_assessment(result, gate, evaluated=False) if gate else result
+        evaluated = False
+    else:
+        evaluated = True
+    return await finalize(result, evaluated=evaluated)

@@ -48,6 +48,53 @@ def trade():
     }
 
 
+def _passing_evidence(proposal):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from packages.domain.options import Greeks, OptionContract, OptionQuote
+    from packages.domain.workflow import CatalystFeatures
+
+    now = datetime.now(UTC)
+    return SimpleNamespace(
+        contracts=(
+            OptionContract(
+                contract_id="fixture-contract",
+                symbol=proposal.legs[0].symbol,
+                underlying_symbol="AAPL",
+                expiration=datetime.strptime(proposal.legs[0].symbol[-15:-9], "%y%m%d").date(),
+                strike=Decimal(200),
+                option_type="call",
+                multiplier=100,
+                tradable=True,
+                quote=OptionQuote(
+                    bid="1.95",
+                    ask="2.05",
+                    bid_size=10,
+                    ask_size=10,
+                    quoted_at=now,
+                    open_interest=1000,
+                    greeks=Greeks(delta=".5", gamma=".01", theta="-.01", vega=".1"),
+                ),
+            ),
+        ),
+        features=CatalystFeatures(
+            catalyst_confidence=".9",
+            sentiment=".8",
+            relative_volume=3,
+            price_momentum=".8",
+            gap_percent=1,
+            market_confirmation=".8",
+            sector_confirmation=".8",
+            liquidity_score=".9",
+        ),
+        features_at=now,
+        spot=Decimal(200),
+        greeks_at=now,
+        greeks_source="synthetic-test-provider",
+    )
+
+
 def test_standalone_endpoint_needs_no_watchlist_or_client_broker_account():
     response = client().post("/api/v2/option-trade-assessments", json=trade())
     assert response.status_code == 200
@@ -68,58 +115,17 @@ def test_standalone_endpoint_needs_no_watchlist_or_client_broker_account():
 
 
 def test_on_demand_evidence_passes_for_never_scanned_symbol():
-    from datetime import UTC, datetime
-    from decimal import Decimal
-
-    from packages.domain.options import Greeks, OptionContract, OptionQuote
-    from packages.domain.workflow import CatalystFeatures
-
-    now = datetime.now(UTC)
-
     class EvidenceProvider:
+        def __init__(self):
+            self.evidence = None
+
         async def get_evidence(self, proposal):
-            return SimpleNamespace(
-                contracts=(
-                    OptionContract(
-                        contract_id="fixture-contract",
-                        symbol=proposal.legs[0].symbol,
-                        underlying_symbol="AAPL",
-                        expiration=datetime.strptime(
-                            proposal.legs[0].symbol[-15:-9], "%y%m%d"
-                        ).date(),
-                        strike=Decimal(200),
-                        option_type="call",
-                        multiplier=100,
-                        tradable=True,
-                        quote=OptionQuote(
-                            bid="1.95",
-                            ask="2.05",
-                            bid_size=10,
-                            ask_size=10,
-                            quoted_at=now,
-                            open_interest=1000,
-                            greeks=Greeks(delta=".5", gamma=".01", theta="-.01", vega=".1"),
-                        ),
-                    ),
-                ),
-                features=CatalystFeatures(
-                    catalyst_confidence=".9",
-                    sentiment=".8",
-                    relative_volume=3,
-                    price_momentum=".8",
-                    gap_percent=1,
-                    market_confirmation=".8",
-                    sector_confirmation=".8",
-                    liquidity_score=".9",
-                ),
-                features_at=now,
-                spot=Decimal(200),
-                greeks_at=now,
-                greeks_source="synthetic-test-provider",
-            )
+            self.evidence = _passing_evidence(proposal)
+            return self.evidence
 
     c = client()
-    c.app.state.trade_assessment_provider_factory = lambda key: EvidenceProvider()
+    provider = EvidenceProvider()
+    c.app.state.trade_assessment_provider_factory = lambda key: provider
     c.app.state.database.sessions = lambda: Session()
     response = c.post("/api/v2/option-trade-assessments", json=trade())
     assert response.status_code == 200
@@ -132,11 +138,13 @@ def test_on_demand_evidence_passes_for_never_scanned_symbol():
     assert result["expires_at"]
     assert result["score_profile"] == "catalyst_momentum_v1"
     assert result["score_components"]
-    assert result["evidence_as_of"] == now.isoformat()
+    assert result["evidence_as_of"] == provider.evidence.features_at.isoformat()
     assert result["market_data"]["feed"] == "indicative"
     assert result["market_data"]["quality"] == "testing_only"
     assert result["market_data"]["source_quote_times"] == {
-        trade()["legs"][0]["symbol"]: now.isoformat()
+        provider.evidence.contracts[0].symbol: provider.evidence.contracts[
+            0
+        ].quote.quoted_at.isoformat()
     }
     from packages.connected.trade_assessment import TradeRequest, validate_pass_receipt
 

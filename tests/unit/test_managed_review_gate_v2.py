@@ -75,7 +75,12 @@ class _GateSession:
         from packages.database.models import ManagedReviewGateRecord, WorkspaceRecord
 
         if model is ManagedReviewGateRecord:
-            return self.row if key == (self.row.workspace_id, self.row.assessment_key_id) else None
+            return (
+                self.row
+                if self.row is not None
+                and key == (self.row.workspace_id, self.row.assessment_key_id)
+                else None
+            )
         if model is WorkspaceRecord:
             return SimpleNamespace(assessment_policy=self.profile, status="ACTIVE")
         return None
@@ -226,3 +231,253 @@ def test_managed_policy_route_has_distinct_contract_and_legacy_route_remains_leg
     client.app.dependency_overrides[require_agent_key] = lambda: AgentKeyContext(uuid4(), uuid4())
     legacy = client.get("/api/v2/option-trade-assessments/policy").json()
     assert "contract_version" not in legacy and legacy["human_approval_required"] is True
+
+
+def test_managed_assessment_rechecks_gate_after_provider_work_and_finalizes_unavailable():
+    import asyncio
+    import threading
+
+    client, row, _workspace_id, _key_id = _gate_client()
+    started, release = threading.Event(), threading.Event()
+
+    class Provider:
+        async def get_evidence(self, _trade):
+            from packages.connected.direct_evidence import EvidenceUnavailable
+
+            started.set()
+            assert await asyncio.to_thread(release.wait, 2)
+            raise EvidenceUnavailable("market_data_not_configured")
+
+    client.app.state.trade_assessment_provider_factory = lambda _key: Provider()
+    client.app.state.credential_cipher = None
+    result = {}
+
+    def request_assessment():
+        result["response"] = client.post(
+            "/api/v2/option-trade-assessments",
+            json={
+                "legs": [{"symbol": "AAPL261120C00200000", "side": "buy"}],
+                "quantity": 1,
+                "limit_price": "2",
+            },
+        )
+
+    worker = threading.Thread(target=request_assessment)
+    worker.start()
+    try:
+        assert started.wait(2)
+        row.enabled = True
+        row.revision += 1
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    body = result["response"].json()
+    assert body["contract_version"] == "managed-assessment-v1"
+    assert body["approval_gate"]["required"] is True
+    assert body["approval_gate"]["revision"] == row.revision
+    assert body["decision"] == "UNAVAILABLE" and body["signal_score"] is None
+    assert body["blocking_reasons"] == ["human_approval_required"]
+
+
+def test_managed_unavailable_early_return_keeps_managed_contract_and_reason():
+    client, _row, _workspace_id, _key_id = _gate_client()
+    client.app.state.credential_cipher = None
+    client.app.state.trade_assessment_provider_factory = None
+    body = client.post(
+        "/api/v2/option-trade-assessments",
+        json={
+            "legs": [{"symbol": "AAPL261120C00200000", "side": "buy"}],
+            "quantity": 1,
+            "limit_price": "2",
+        },
+    ).json()
+    assert body["contract_version"] == "managed-assessment-v1"
+    assert body["approval_gate"]["required"] is False
+    assert body["decision"] == "UNAVAILABLE" and body["signal_score"] is None
+    assert body["blocking_reasons"] == ["market_data_unavailable"]
+
+
+def test_managed_off_finalizes_missing_unverified_and_malformed_credentials(monkeypatch):
+    import apps.api.routes.assessment as route
+
+    def check_kind(kind):
+        client, _row, _workspace_id, _key_id = _gate_client()
+        record = (
+            None
+            if kind == "missing"
+            else SimpleNamespace(
+                enabled=True,
+                validation_status="PENDING" if kind == "unverified" else "VERIFIED",
+                key_version=1,
+                nonce=b"fixture",
+                ciphertext=b"fixture",
+                fingerprint="fixture",
+            )
+        )
+
+        class Store:
+            def __init__(self, *_args):
+                pass
+
+            async def get(self, *_args):
+                return record
+
+        class Cipher:
+            def decrypt(self, *_args):
+                return {"api_key": "wrong-name", "secret_key": "fixture"}
+
+        monkeypatch.setattr(route, "CredentialStore", Store)
+        client.app.state.credential_cipher = Cipher()
+        body = client.post(
+            "/api/v2/option-trade-assessments",
+            json={
+                "legs": [{"symbol": "AAPL261120C00200000", "side": "buy"}],
+                "quantity": 1,
+                "limit_price": "2",
+            },
+        ).json()
+        assert body["contract_version"] == "managed-assessment-v1"
+        assert body["approval_gate"]["required"] is False
+        assert body["decision"] == "UNAVAILABLE" and body["signal_score"] is None
+        assert body["blocking_reasons"] == ["market_data_not_configured"]
+
+    for kind in ("missing", "unverified", "malformed"):
+        check_kind(kind)
+
+
+def test_managed_off_finalizes_provider_error_and_timeout(monkeypatch):
+    import apps.api.routes.assessment as route
+    from packages.connected.direct_evidence import EvidenceUnavailable
+
+    class FailingProvider:
+        async def get_evidence(self, _trade):
+            raise EvidenceUnavailable("managed_fixture_provider_error")
+
+    client, _row, _workspace_id, _key_id = _gate_client()
+    client.app.state.trade_assessment_provider_factory = lambda _key: FailingProvider()
+    body = client.post(
+        "/api/v2/option-trade-assessments",
+        json={
+            "legs": [{"symbol": "AAPL261120C00200000", "side": "buy"}],
+            "quantity": 1,
+            "limit_price": "2",
+        },
+    ).json()
+    assert body["contract_version"] == "managed-assessment-v1"
+    assert body["approval_gate"]["required"] is False
+    assert body["blocking_reasons"] == ["managed_fixture_provider_error"]
+
+    async def expired(awaitable, **_kwargs):
+        awaitable.close()
+        raise TimeoutError("fixture-private-detail")
+
+    monkeypatch.setattr(route.asyncio, "wait_for", expired)
+    client, _row, _workspace_id, _key_id = _gate_client()
+    client.app.state.trade_assessment_provider_factory = lambda _key: FailingProvider()
+    response = client.post(
+        "/api/v2/option-trade-assessments",
+        json={
+            "legs": [{"symbol": "AAPL261120C00200000", "side": "buy"}],
+            "quantity": 1,
+            "limit_price": "2",
+        },
+    )
+    body = response.json()
+    assert body["contract_version"] == "managed-assessment-v1"
+    assert body["approval_gate"]["required"] is False
+    assert body["blocking_reasons"] == ["assessment_deadline_exceeded"]
+    assert "fixture-private-detail" not in response.text
+
+
+def test_managed_passing_assessment_is_withheld_when_gate_turns_on_during_evaluation():
+    import asyncio
+    import threading
+
+    from tests.api.test_standalone_assessment import _passing_evidence, trade
+
+    client, row, _workspace_id, _key_id = _gate_client()
+    proposal = trade()
+
+    class Provider:
+        def __init__(self, started=None, release=None):
+            self.started, self.release = started, release
+
+        async def get_evidence(self, request):
+            if self.started:
+                self.started.set()
+                await asyncio.to_thread(self.release.wait, 2)
+            return _passing_evidence(request)
+
+    client.app.state.trade_assessment_provider_factory = lambda _key: Provider()
+    baseline = client.post("/api/v2/option-trade-assessments", json=proposal).json()
+    assert baseline["decision"] == "PASS"
+    assert baseline["approval_gate"]["required"] is False
+
+    started, release = threading.Event(), threading.Event()
+    client.app.state.trade_assessment_provider_factory = lambda _key: Provider(started, release)
+    result = {}
+
+    def request_assessment():
+        result["response"] = client.post("/api/v2/option-trade-assessments", json=proposal)
+
+    worker = threading.Thread(target=request_assessment)
+    worker.start()
+    try:
+        assert started.wait(2)
+        row.enabled = True
+        row.revision += 1
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    body = result["response"].json()
+    assert body["decision"] == "UNAVAILABLE" and body["signal_score"] is None
+    assert body["blocking_reasons"] == ["human_approval_required"]
+    assert body["approval_gate"] == {
+        "required": True,
+        "revision": row.revision,
+        "scope": body["approval_gate"]["scope"],
+    }
+
+
+def test_disappearing_managed_binding_reports_unknown_without_fabricating_lock():
+    import asyncio
+    import threading
+
+    from tests.api.test_standalone_assessment import _passing_evidence, trade
+
+    client, _row, workspace_id, key_id = _gate_client()
+    started, release = threading.Event(), threading.Event()
+
+    class Provider:
+        async def get_evidence(self, request):
+            started.set()
+            await asyncio.to_thread(release.wait, 2)
+            return _passing_evidence(request)
+
+    client.app.state.trade_assessment_provider_factory = lambda _key: Provider()
+    result = {}
+
+    def request_assessment():
+        result["response"] = client.post("/api/v2/option-trade-assessments", json=trade())
+
+    worker = threading.Thread(target=request_assessment)
+    worker.start()
+    try:
+        assert started.wait(2)
+        client.app.state.database.sessions.row = None
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    body = result["response"].json()
+    assert body["decision"] == "UNAVAILABLE" and body["signal_score"] is None
+    assert body["blocking_reasons"] == ["managed_policy_unavailable"]
+    assert body["approval_gate"]["required"] is None
+    assert body["approval_gate"]["status"] == "unknown"
+    assert body["approval_gate"]["scope"] == {
+        "workspace_id": str(workspace_id),
+        "assessment_key_id": str(key_id),
+    }
+    assert "human_approval_required" not in body["blocking_reasons"]
