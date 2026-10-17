@@ -73,6 +73,29 @@ class AgentAPIKeyRecord(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class ManagedReviewGateRecord(Base):
+    """Explicitly provisioned review lock bound to one workspace and agent key."""
+
+    __tablename__ = "managed_review_gates"
+    __table_args__ = (UniqueConstraint("assessment_key_id", name="uq_managed_review_gate_key"),)
+
+    workspace_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    assessment_key_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("agent_api_keys.key_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    control_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class InvitationRecord(Base):
     __tablename__ = "invitations"
 
