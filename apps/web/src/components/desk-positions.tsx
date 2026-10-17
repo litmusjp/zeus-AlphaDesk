@@ -48,6 +48,13 @@ type Order = {
 
 type Broker = {
   state: string;
+  last_reconciled_at?: string | null;
+  last_stream_event_at?: string | null;
+  stream_connected?: boolean;
+  generation?: number;
+  divergence_count?: number;
+  failure_reason?: string | null;
+  refresh_error?: string;
 };
 
 function parseOptionSymbol(symbol: string) {
@@ -87,7 +94,12 @@ export function DeskPositions() {
       ]);
       setState({ account, positions, orders, broker });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load projections");
+      const message = e instanceof Error ? e.message : "Failed to load projections";
+      setError(message);
+      setState((current) => current ? {
+        ...current,
+        broker: { ...current.broker, state: "UNAVAILABLE", refresh_error: message },
+      } : current);
     }
   }, []);
 
@@ -133,16 +145,34 @@ export function DeskPositions() {
   const pendingOrders = state.orders.filter(
     (o) => o.status === "accepted" || o.status === "new" || o.status === "pending_new"
   );
+  const brokerIsReconciled = state.broker.state === "RECONCILED"
+    && state.broker.divergence_count === 0
+    && state.broker.failure_reason === null
+    && Boolean(state.broker.last_reconciled_at)
+    && !state.broker.refresh_error;
+  const brokerDisplayState = state.broker.refresh_error
+    ? "UNAVAILABLE"
+    : state.broker.state === "RECONCILED" && !brokerIsReconciled
+      ? "CHECK REQUIRED"
+      : state.broker.state;
+  const brokerDetails = [
+    `API state: ${state.broker.state}`,
+    `Last reconciled: ${state.broker.last_reconciled_at ?? "unavailable"}`,
+    `Last stream event: ${state.broker.last_stream_event_at ?? "unavailable"}`,
+    `Stream ${state.broker.stream_connected ? "connected" : "disconnected"}`,
+    `Generation ${state.broker.generation ?? "unavailable"}`,
+    `${state.broker.divergence_count ?? 0} divergences`,
+    state.broker.failure_reason ? `Failure: ${state.broker.failure_reason}` : null,
+    state.broker.refresh_error ? `Refresh failed: ${state.broker.refresh_error}` : null,
+  ].filter(Boolean).join(" · ");
 
   return (
     <>
       <div className="mode-banner">
         <ShieldCheck />
         <div>
-          <strong>Connected Paper Read Model · Continuous Broker Parity</strong>
-          <span>
-            Internal read models are synchronized continuously with Alpaca trade updates. Broker truth strictly prevails on any discrepancy.
-          </span>
+          <strong>Broker status: {brokerDisplayState}</strong>
+          <span>{brokerDetails}</span>
         </div>
       </div>
 
@@ -163,8 +193,8 @@ export function DeskPositions() {
         <StateCard
           title="ACTIVE POSITIONS"
           value={`${state.positions.length} Contract${state.positions.length === 1 ? "" : "s"}`}
-          detail="Broker-confirmed exposure"
-          tone={state.positions.length > 0 ? "good" : "neutral"}
+          detail="Broker position projection"
+          tone={brokerIsReconciled && state.positions.length > 0 ? "good" : "neutral"}
         />
         <StateCard
           title="WORKING ORDERS"
@@ -174,9 +204,9 @@ export function DeskPositions() {
         />
         <StateCard
           title="BROKER RECONCILIATION"
-          value={state.broker.state}
-          detail="Freshness verified · Live 10s sync"
-          tone={state.broker.state === "RECONCILED" ? "good" : "warn"}
+          value={brokerDisplayState}
+          detail={brokerIsReconciled ? "No reported divergences or failure" : brokerDetails}
+          tone={brokerIsReconciled ? "good" : "warn"}
         />
       </div>
 
@@ -198,7 +228,9 @@ export function DeskPositions() {
           <small>PORTFOLIO EXPOSURE</small>
           <h2>Open Option Contracts & Positions</h2>
         </div>
-        <span className="status-pill good">ALL EXPOSURE RECONCILED · LIVE 10S</span>
+        <span className={`status-pill ${brokerIsReconciled ? "good" : "warn"}`}>
+          {brokerIsReconciled ? "EXPOSURE RECONCILED" : `RECONCILIATION ${brokerDisplayState}`}
+        </span>
       </div>
       <p style={{ fontSize: "12px", color: "#5a6864", margin: "4px 0 14px 0" }}>
         Market hours for U.S. options are <strong>9:30 AM – 4:00 PM Eastern Time</strong>. Closing market orders execute during regular trading hours.
@@ -264,7 +296,9 @@ export function DeskPositions() {
                     {Math.abs(unrealized).toFixed(2)}
                   </strong>
                 </div>
-                <span className="status-pill good">RECONCILED</span>
+                <span className={`status-pill ${brokerIsReconciled ? "good" : "warn"}`}>
+                  {brokerIsReconciled ? "RECONCILED" : `BROKER ${brokerDisplayState}`}
+                </span>
                 <div>
                   {isSelected ? (
                     selectedMode === "choose" ? (
