@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 @dataclass(frozen=True)
@@ -13,6 +16,24 @@ class ManagedReviewGate:
     assessment_key_id: UUID
     enabled: bool
     revision: int
+
+
+class ManagedQualitySettings(BaseModel):
+    """Strict, standalone assessment quality controls for one managed connection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    minimum_signal_score: Decimal = Field(default=Decimal("30"), ge=0, le=100)
+    minimum_catalyst_confidence: Decimal = Field(default=Decimal("0.20"), ge=0, le=1)
+    require_price_action_confirmation: StrictBool = True
+
+
+def managed_quality_payload(settings: ManagedQualitySettings) -> dict[str, Any]:
+    return {
+        "minimum_signal_score": str(settings.minimum_signal_score),
+        "minimum_catalyst_confidence": str(settings.minimum_catalyst_confidence),
+        "require_price_action_confirmation": settings.require_price_action_confirmation,
+    }
 
 
 def managed_assessment(

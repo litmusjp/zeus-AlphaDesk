@@ -91,6 +91,8 @@ class ManagedReviewGateRecord(Base):
     )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    quality_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    quality_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     control_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

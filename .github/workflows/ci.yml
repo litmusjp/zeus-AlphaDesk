@@ -98,3 +98,4 @@ jobs:
       - run: uv run alembic upgrade head
       - run: uv run alembic downgrade 20260917_0011
       - run: uv run alembic upgrade head
+      - run: ALPHADESK_RUN_INTEGRATION=1 ALPHADESK_TEST_DATABASE_URL=postgresql+psycopg://alphadesk:alphadesk_dev@localhost:5432/alphadesk uv run pytest tests/integration/test_managed_quality_persistence.py -q

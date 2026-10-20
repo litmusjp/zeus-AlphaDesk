@@ -4,7 +4,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 from packages.domain.broker import BrokerPosition
 from packages.risk.engine import RiskPolicy
@@ -202,6 +202,7 @@ class AssessmentPolicy(BaseModel):
     minimum_catalyst_confidence: Decimal = Field(
         default=Decimal("0.60"), ge=Decimal("0"), le=Decimal("1")
     )
+    require_price_action_confirmation: bool = True
     pre_scan_minimum_catalyst_confidence: Decimal = Field(
         default=Decimal("0.40"), ge=Decimal("0"), le=Decimal("1")
     )
@@ -242,10 +243,17 @@ class AssessmentPolicy(BaseModel):
     max_abs_portfolio_vega: Decimal = Field(default=Decimal("5000"), gt=0, le=Decimal("1000000"))
 
     @model_validator(mode="after")
-    def validate_ranges(self) -> AssessmentPolicy:
-        if self.pre_scan_minimum_signal_score > self.minimum_signal_score:
+    def validate_ranges(self, info: ValidationInfo) -> AssessmentPolicy:
+        managed_receipt_validation = bool(
+            isinstance(info.context, dict) and info.context.get("managed_quality_receipt") is True
+        )
+        if not managed_receipt_validation and (
+            self.pre_scan_minimum_signal_score > self.minimum_signal_score
+        ):
             raise ValueError("pre-scan signal score cannot be stricter than execution")
-        if self.pre_scan_minimum_catalyst_confidence > self.minimum_catalyst_confidence:
+        if not managed_receipt_validation and (
+            self.pre_scan_minimum_catalyst_confidence > self.minimum_catalyst_confidence
+        ):
             raise ValueError("pre-scan catalyst confidence cannot be stricter than execution")
         if self.maximum_dte < self.minimum_dte:
             raise ValueError("maximum_dte must be greater than or equal to minimum_dte")
@@ -262,7 +270,11 @@ class AssessmentPolicy(BaseModel):
 
     @classmethod
     def from_payload(cls, payload: dict[str, object] | None) -> AssessmentPolicy:
-        return cls.model_validate(payload or {})
+        values = dict(payload or {})
+        # Managed-only evaluator controls must never become workspace/scanner settings.
+        values.pop("require_price_action_confirmation", None)
+        values.pop("managed_quality_override", None)
+        return cls.model_validate(values)
 
     def order_sizing_error(self, *, quantity: int, max_loss: Decimal) -> str | None:
         if quantity > self.maximum_contracts_per_candidate:

@@ -23,10 +23,15 @@ from packages.strategy.catalyst import CatalystMomentumStrategy, score_component
 
 SCORE_PROFILE = "catalyst_momentum_v1"
 ADVISORY_POLICY_PROFILE = "paper_advisory_greeks_v1"
-ADVISORY_POLICY_RULE = {"profile": ADVISORY_POLICY_PROFILE, "paper_only": True,
-                        "require_greek_values": True, "unknown_greek_calculation_time": "warning"}
-ADVISORY_POLICY_HASH = sha256(json.dumps(ADVISORY_POLICY_RULE, sort_keys=True,
-                                         separators=(",", ":")).encode()).hexdigest()
+ADVISORY_POLICY_RULE = {
+    "profile": ADVISORY_POLICY_PROFILE,
+    "paper_only": True,
+    "require_greek_values": True,
+    "unknown_greek_calculation_time": "warning",
+}
+ADVISORY_POLICY_HASH = sha256(
+    json.dumps(ADVISORY_POLICY_RULE, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
 
 
 def _score_metadata(features: Any) -> dict[str, Any]:
@@ -86,9 +91,15 @@ def proposal_fingerprint(trade: TradeRequest) -> str:
 
 def policy_metadata(policy: AssessmentPolicy) -> dict[str, Any]:
     snapshot = policy.model_dump(mode="json")
+    # ON is the pre-existing implicit behavior; keep its wire representation stable.
+    # OFF is explicit in the snapshot and changes the effective policy fingerprint.
+    if policy.require_price_action_confirmation:
+        snapshot.pop("require_price_action_confirmation")
     advisory_bytes = json.dumps(
-        {"workspace_policy": snapshot, **ADVISORY_POLICY_RULE}, sort_keys=True,
-        separators=(",", ":"), ensure_ascii=True
+        {"workspace_policy": snapshot, **ADVISORY_POLICY_RULE},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     )
     return {
         "scope": "TRADE_ASSESSMENT",
@@ -142,7 +153,13 @@ def validate_pass_receipt(
         as_of = datetime.fromisoformat(result["evidence_as_of"].replace("Z", "+00:00"))
         components = result["score_components"]
         component_values = [Decimal(str(v)) for v in components.values()]
-        snapshot = AssessmentPolicy.model_validate(result["policy_snapshot"])
+        snapshot_payload = result["policy_snapshot"]
+        # Workspace settings were validated before the standalone managed threshold
+        # was applied. Receipt validation may therefore skip only these two
+        # pre-scan/execution relationships; all field and range checks still apply.
+        snapshot = AssessmentPolicy.model_validate(
+            snapshot_payload, context={"managed_quality_receipt": True}
+        )
     except (KeyError, AttributeError, TypeError, ValueError, ArithmeticError):
         return False
     score_value = result.get("signal_score")
@@ -168,9 +185,12 @@ def validate_pass_receipt(
     ):
         return False
     limits = {
-        "catalyst_confidence": Decimal("0.30"), "sentiment": Decimal("0.15"),
-        "directional_momentum": Decimal("0.20"), "relative_volume": Decimal("0.10"),
-        "market_confirmation": Decimal("0.075"), "sector_confirmation": Decimal("0.075"),
+        "catalyst_confidence": Decimal("0.30"),
+        "sentiment": Decimal("0.15"),
+        "directional_momentum": Decimal("0.20"),
+        "relative_volume": Decimal("0.10"),
+        "market_confirmation": Decimal("0.075"),
+        "sector_confirmation": Decimal("0.075"),
         "liquidity": Decimal("0.10"),
     }
     if not isinstance(components, dict) or set(components) != set(limits):
@@ -184,39 +204,55 @@ def validate_pass_receipt(
     normalized_components = {name: Decimal(str(components[name])) for name in limits}
     if any(value < 0 or value > limits[name] for name, value in normalized_components.items()):
         return False
-    advisory_bytes = json.dumps({"workspace_policy": snapshot.model_dump(mode="json"),
-                                 **ADVISORY_POLICY_RULE}, sort_keys=True,
-                                separators=(",", ":"), ensure_ascii=True)
+    advisory_bytes = json.dumps(
+        {"workspace_policy": snapshot_payload, **ADVISORY_POLICY_RULE},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
     expected_version = "standalone-paper-advisory-v1:" + sha256(advisory_bytes.encode()).hexdigest()
-    if (result.get("policy_version") != expected_version
-            or result.get("advisory_policy_profile") != ADVISORY_POLICY_PROFILE
-            or result.get("advisory_policy_hash") != ADVISORY_POLICY_HASH
-            or result.get("paper_only") is not True
-            or result.get("human_approval_required") is not True):
+    if (
+        result.get("policy_version") != expected_version
+        or result.get("advisory_policy_profile") != ADVISORY_POLICY_PROFILE
+        or result.get("advisory_policy_hash") != ADVISORY_POLICY_HASH
+        or result.get("paper_only") is not True
+        or result.get("human_approval_required") is not True
+    ):
         return False
     market = result.get("market_data")
     if not isinstance(market, dict) or any(
         market.get(key) != expected
-        for key, expected in (("source", "alpaca"), ("feed", "indicative"),
-                              ("quality", "testing_only"))
+        for key, expected in (
+            ("source", "alpaca"),
+            ("feed", "indicative"),
+            ("quality", "testing_only"),
+        )
     ):
         return False
-    greek_time, greek_source = market.get("greeks_calculated_at"), market.get(
-        "greeks_calculation_provenance"
+    greek_time, greek_source = (
+        market.get("greeks_calculated_at"),
+        market.get("greeks_calculation_provenance"),
     )
     if greek_time is None:
-        if (market.get("greeks_calculation_freshness") != "unknown" or greek_source is not None
-                or market.get("warnings") != ["greek_calculation_time_unknown"]):
+        if (
+            market.get("greeks_calculation_freshness") != "unknown"
+            or greek_source is not None
+            or market.get("warnings") != ["greek_calculation_time_unknown"]
+        ):
             return False
     else:
         try:
             parsed_greek_time = datetime.fromisoformat(greek_time.replace("Z", "+00:00"))
         except (AttributeError, TypeError, ValueError):
             return False
-        if (not isinstance(greek_source, str) or not greek_source.strip()
-                or not parsed_greek_time.tzinfo or parsed_greek_time > observed
-                or market.get("greeks_calculation_freshness") != "verified"
-                or market.get("warnings") != []):
+        if (
+            not isinstance(greek_source, str)
+            or not greek_source.strip()
+            or not parsed_greek_time.tzinfo
+            or parsed_greek_time > observed
+            or market.get("greeks_calculation_freshness") != "verified"
+            or market.get("warnings") != []
+        ):
             return False
     if result.get("trade_fingerprint") != proposal_fingerprint(proposal):
         return False
@@ -244,12 +280,15 @@ def validate_pass_receipt(
 
 
 def unavailable(
-    trade: TradeRequest, policy: AssessmentPolicy, code: str = "market_data_unavailable",
+    trade: TradeRequest,
+    policy: AssessmentPolicy,
+    code: str = "market_data_unavailable",
     evidence: Any = None,
 ) -> dict[str, Any]:
     received = evidence is not None
-    quote_times = ({c.symbol: c.quote.quoted_at.isoformat() for c in evidence.contracts}
-                   if received else None)
+    quote_times = (
+        {c.symbol: c.quote.quoted_at.isoformat() for c in evidence.contracts} if received else None
+    )
     greek_at = getattr(evidence, "greeks_at", None) if received else None
     greek_source = getattr(evidence, "greeks_source", None) if received else None
     greek_freshness = "unknown"
@@ -260,9 +299,15 @@ def unavailable(
         greek_warnings = ["greek_calculation_time_invalid"]
         max_age = timedelta(seconds=policy.execution_max_quote_age_seconds)
         current = datetime.now(UTC)
-        if (greek_at is not None and isinstance(greek_source, str) and greek_source.strip()
-                and isinstance(greek_at, datetime) and greek_at.tzinfo is not None
-                and greek_at <= current and current - greek_at < max_age):
+        if (
+            greek_at is not None
+            and isinstance(greek_source, str)
+            and greek_source.strip()
+            and isinstance(greek_at, datetime)
+            and greek_at.tzinfo is not None
+            and greek_at <= current
+            and current - greek_at < max_age
+        ):
             greek_freshness = "verified"
             greek_warnings = []
     return {
@@ -274,18 +319,12 @@ def unavailable(
             "feed": getattr(evidence, "market_data_feed", "indicative") if received else None,
             "requested_feed": "indicative",
             "quality": "testing_only",
-            "greeks_calculation_provenance": (
-                greek_source
-            ),
+            "greeks_calculation_provenance": (greek_source),
             "greeks_calculated_at": (
                 greek_at.isoformat() if isinstance(greek_at, datetime) else None
             ),
-            "greeks_calculation_freshness": (
-                greek_freshness
-            ),
-            "warnings": (
-                greek_warnings
-            ),
+            "greeks_calculation_freshness": (greek_freshness),
+            "warnings": (greek_warnings),
             "source_quote_times": quote_times,
         },
         "signal_score": None,
@@ -305,19 +344,33 @@ def unavailable(
 _OCC = re.compile(r"^([A-Z0-9]{1,6})(\d{6})([CP])(\d{8})$")
 
 
+def _spread_strategy_type(
+    symbol: str,
+) -> Literal["BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD"]:
+    match = _OCC.fullmatch(symbol)
+    if match is None:
+        raise ValueError("unsupported option symbol")
+    return "BULL_CALL_DEBIT_SPREAD" if match[3] == "C" else "BEAR_PUT_DEBIT_SPREAD"
+
+
 def supported_shape(trade: TradeRequest) -> bool:
     matches = [_OCC.fullmatch(leg.symbol) for leg in trade.legs]
+    if any(match is None for match in matches):
+        return False
+    valid_matches = [match for match in matches if match is not None]
     if any(leg.ratio_quantity != 1 for leg in trade.legs):
         return False
     if len(trade.legs) == 1:
         return trade.legs[0].side == "buy"
     if len({leg.symbol for leg in trade.legs}) != 2:
         return False
-    if len({(m[1], m[2], m[3]) for m in matches}) != 1:
+    if len({(m[1], m[2], m[3]) for m in valid_matches}) != 1:
         return False
-    long = next((m for leg, m in zip(trade.legs, matches, strict=True) if leg.side == "buy"), None)
+    long = next(
+        (m for leg, m in zip(trade.legs, valid_matches, strict=True) if leg.side == "buy"), None
+    )
     short = next(
-        (m for leg, m in zip(trade.legs, matches, strict=True) if leg.side == "sell"), None
+        (m for leg, m in zip(trade.legs, valid_matches, strict=True) if leg.side == "sell"), None
     )
     if long is None or short is None:
         return False
@@ -344,6 +397,8 @@ def evaluate(
         if contract is None:
             return unavailable(trade, policy, "contract_evidence_missing", evidence)
         match = _OCC.fullmatch(leg.symbol)
+        if match is None:
+            return unavailable(trade, policy, "unsupported_strategy", evidence)
         if (
             contract.underlying_symbol != match[1]
             or contract.expiration != datetime.strptime(match[2], "%y%m%d").date()
@@ -364,8 +419,7 @@ def evaluate(
     ):
         result = unavailable(trade, policy, "open_interest_missing", evidence)
         result["market_data"]["source_quote_times"] = {
-            symbol: contract.quote.quoted_at.isoformat()
-            for symbol, contract in contracts.items()
+            symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
         result["signal_score"] = float(score_signal(evidence.features))
         result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
@@ -373,20 +427,19 @@ def evaluate(
     if any(c.quote.greeks is None for c in contracts.values()):
         result = unavailable(trade, policy, "option_greeks_missing", evidence)
         result["market_data"]["source_quote_times"] = {
-            symbol: contract.quote.quoted_at.isoformat()
-            for symbol, contract in contracts.items()
+            symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
         result["signal_score"] = float(score_signal(evidence.features))
         result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
         return result
     greeks_source = evidence.greeks_source
-    if ((evidence.greeks_at is None) != (not greeks_source)
-            or (greeks_source is not None and (not isinstance(greeks_source, str)
-                                               or not greeks_source.strip()))):
+    if (evidence.greeks_at is None) != (not greeks_source) or (
+        greeks_source is not None
+        and (not isinstance(greeks_source, str) or not greeks_source.strip())
+    ):
         result = unavailable(trade, policy, "greek_provenance_contradictory", evidence)
         result["market_data"]["source_quote_times"] = {
-            symbol: contract.quote.quoted_at.isoformat()
-            for symbol, contract in contracts.items()
+            symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
         result["signal_score"] = float(score_signal(evidence.features))
         result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
@@ -446,11 +499,7 @@ def evaluate(
         underlying_symbol=underlying,
         strategy_type="SINGLE_LEG_OPTION"
         if len(legs) == 1
-        else (
-            "BULL_CALL_DEBIT_SPREAD"
-            if _OCC.fullmatch(legs[0].symbol)[3] == "C"
-            else "BEAR_PUT_DEBIT_SPREAD"
-        ),
+        else _spread_strategy_type(legs[0].symbol),
         side="buy",
         quantity=trade.quantity,
         limit_price=trade.limit_price,
@@ -466,6 +515,7 @@ def evaluate(
         minimum_score=policy.minimum_signal_score,
         maximum_gap=policy.maximum_gap_percent,
         minimum_catalyst_confidence=policy.minimum_catalyst_confidence,
+        require_price_action_confirmation=policy.require_price_action_confirmation,
     )
     idea = strategy.evaluate_signal(
         Signal(
@@ -477,7 +527,7 @@ def evaluate(
         )
     )
     direction = None if isinstance(idea, NoTrade) else idea.direction.value
-    result = assess_strategy(
+    strategy_result = assess_strategy(
         request,
         policy,
         paper_equity=None,
@@ -490,7 +540,7 @@ def evaluate(
         standalone=True,
     )
     checks = []
-    for original in result.checks:
+    for original in strategy_result.checks:
         c = original.model_dump(mode="json")
         message = c["reason"]
         if not c["passed"] and c["code"] == "policy_loss":
@@ -513,7 +563,7 @@ def evaluate(
             }
         )
 
-    def check(code, passed, actual, threshold, remediation):
+    def check(code: str, passed: bool, actual: Any, threshold: Any, remediation: str) -> None:
         checks.append(
             {
                 "code": code,
@@ -547,6 +597,27 @@ def evaluate(
                 *mapping[reason],
                 "Use genuinely stronger evidence; changing quantity cannot repair a weak signal.",
             )
+    price_action_confirmation = (
+        "required_and_confirmed"
+        if policy.require_price_action_confirmation
+        and evidence.features.price_momentum
+        * (Decimal("1") if evidence.features.sentiment >= 0 else Decimal("-1"))
+        > 0
+        else (
+            "not_required_by_operator_policy"
+            if not policy.require_price_action_confirmation
+            else "required_but_not_confirmed"
+        )
+    )
+    if not policy.require_price_action_confirmation:
+        check(
+            "price_action_confirmation_policy",
+            True,
+            "not_required_by_operator_policy",
+            "operator_policy",
+            "Operator policy did not require price-action confirmation; evidence is not classified "
+            "as confirmed.",
+        )
     for leg in trade.legs:
         c = contracts[leg.symbol]
         dte = (c.expiration - now.date()).days
@@ -583,9 +654,11 @@ def evaluate(
         )
     failed = [c for c in checks if not c["passed"]]
     decision = (
-        result.decision if result.decision == "UNAVAILABLE" else ("FAIL" if failed else "PASS")
+        strategy_result.decision
+        if strategy_result.decision == "UNAVAILABLE"
+        else ("FAIL" if failed else "PASS")
     )
-    return {
+    receipt = {
         **unavailable(trade, policy),
         "decision": decision,
         "signal_score": float(score),
@@ -621,3 +694,6 @@ def evaluate(
         "account_checks": "Delegated to caller: identity, buying power, portfolio/exposure limits, "
         "fees, reconciliation and execution authorization.",
     }
+    if not policy.require_price_action_confirmation:
+        receipt["price_action_confirmation"] = price_action_confirmation
+    return receipt

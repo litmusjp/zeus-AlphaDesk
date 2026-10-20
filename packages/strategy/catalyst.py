@@ -63,10 +63,12 @@ class CatalystMomentumStrategy:
         minimum_score: Decimal = Decimal("65"),
         maximum_gap: Decimal = Decimal("12"),
         minimum_catalyst_confidence: Decimal = Decimal("0.60"),
+        require_price_action_confirmation: bool = True,
     ) -> None:
         self._minimum_score = minimum_score
         self._maximum_gap = maximum_gap
         self._minimum_catalyst_confidence = minimum_catalyst_confidence
+        self._require_price_action_confirmation = require_price_action_confirmation
 
     def evaluate_signal(self, signal: Signal) -> TradeIdea | NoTrade:
         reasons: list[str] = []
@@ -78,7 +80,7 @@ class CatalystMomentumStrategy:
         directional_momentum = signal.features.price_momentum * (
             Decimal("1") if direction is Direction.BULLISH else Decimal("-1")
         )
-        if directional_momentum <= 0:
+        if self._require_price_action_confirmation and directional_momentum <= 0:
             reasons.append("price_action_not_confirming")
         if signal.features.catalyst_confidence < self._minimum_catalyst_confidence:
             reasons.append("weak_catalyst_confidence")
