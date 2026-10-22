@@ -48,7 +48,7 @@ def trade():
     }
 
 
-def _passing_evidence(proposal):
+def _passing_evidence(proposal, catalyst_confidence=".9"):
     from datetime import UTC, datetime
     from decimal import Decimal
 
@@ -79,7 +79,7 @@ def _passing_evidence(proposal):
             ),
         ),
         features=CatalystFeatures(
-            catalyst_confidence=".9",
+            catalyst_confidence=catalyst_confidence,
             sentiment=".8",
             relative_volume=3,
             price_momentum=".8",
@@ -109,6 +109,7 @@ def test_standalone_endpoint_needs_no_watchlist_or_client_broker_account():
     assert result["score_profile"] == "catalyst_momentum_v1"
     assert result["score_components"] is None
     assert result["evidence_as_of"] is None
+    assert "catalyst_confidence" not in result
     assert result["blocking_reasons"] == ["market_data_unavailable"]
     assert result["execution_allowed"] is False
     assert result["remediation"]
@@ -138,6 +139,7 @@ def test_on_demand_evidence_passes_for_never_scanned_symbol():
     assert result["expires_at"]
     assert result["score_profile"] == "catalyst_momentum_v1"
     assert result["score_components"]
+    assert result["catalyst_confidence"] == 0.9
     assert result["evidence_as_of"] == provider.evidence.features_at.isoformat()
     assert result["market_data"]["feed"] == "indicative"
     assert result["market_data"]["quality"] == "testing_only"
@@ -149,6 +151,23 @@ def test_on_demand_evidence_passes_for_never_scanned_symbol():
     from packages.connected.trade_assessment import TradeRequest, validate_pass_receipt
 
     assert validate_pass_receipt(result, TradeRequest.model_validate(trade()))
+
+
+def test_serialized_fail_receipt_keeps_raw_confidence_separate_from_weighted_score():
+    class EvidenceProvider:
+        async def get_evidence(self, proposal):
+            return _passing_evidence(proposal, catalyst_confidence=".2")
+
+    c = client()
+    provider = EvidenceProvider()
+    c.app.state.trade_assessment_provider_factory = lambda key: provider
+    c.app.state.database.sessions = lambda: Session()
+    response = c.post("/api/v2/option-trade-assessments", json=trade())
+    assert response.status_code == 200
+    result = response.json()
+    assert result["decision"] == "FAIL"
+    assert result["catalyst_confidence"] == 0.2
+    assert result["score_components"]["catalyst_confidence"] == 0.06
 
 
 def test_real_provider_factory_uses_canonical_saved_alpaca_credentials(monkeypatch):

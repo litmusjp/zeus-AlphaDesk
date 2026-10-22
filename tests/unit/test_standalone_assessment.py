@@ -11,6 +11,7 @@ from packages.connected.trade_assessment import (
     evaluate,
     policy_metadata,
     proposal_fingerprint,
+    unavailable,
     validate_pass_receipt,
 )
 from packages.domain.options import Greeks, OptionContract, OptionQuote
@@ -99,6 +100,8 @@ def test_pass_is_a_fresh_bound_assessment_never_order_authority():
     assert result["score_components"] == {
         name: float(value) for name, value in score_components(evidence().features).items()
     }
+    assert result["catalyst_confidence"] == 0.9
+    assert result["catalyst_confidence"] != result["score_components"]["catalyst_confidence"]
     assert result["evidence_as_of"] == evidence().features_at.isoformat()
 
 
@@ -108,15 +111,56 @@ def test_fastapi_serialized_pass_receipt_matches_shared_op2_golden(monkeypatch):
     from uuid import UUID
 
     from fastapi.responses import JSONResponse
+
     import packages.connected.trade_assessment as module
 
     monkeypatch.setattr(module, "uuid4", lambda: UUID("888c17f7-e4af-408f-a8bb-50109488f262"))
     trade = proposal(limit_price="1.84", client_reference="op2-receipt-wire-format")
     unknown_greek_time = replace(evidence(), greeks_at=None, greeks_source=None)
-    policy = AssessmentPolicy(minimum_signal_score=Decimal("25"), pre_scan_minimum_signal_score=Decimal("20"))
+    policy = AssessmentPolicy(
+        minimum_signal_score=Decimal("25"), pre_scan_minimum_signal_score=Decimal("20")
+    )
     actual = JSONResponse(content=assess(trade=trade, ev=unknown_greek_time, policy=policy)).body
     golden = Path(__file__).parents[1] / "testdata" / "op2-pass-receipt.json"
     assert actual == golden.read_bytes()
+
+
+def test_raw_catalyst_confidence_is_preserved_on_fail_and_omitted_when_missing():
+    measured = evidence()
+    measured = replace(
+        measured,
+        features=measured.features.model_copy(
+            update={"catalyst_confidence": Decimal("0.71")}
+        ),
+    )
+    measured_result = assess(ev=measured)
+    assert measured_result["catalyst_confidence"] == 0.71
+    assert measured_result["score_components"]["catalyst_confidence"] == 0.213
+
+    weak = evidence()
+    weak = replace(
+        weak,
+        features=weak.features.model_copy(update={"catalyst_confidence": Decimal("0.2")}),
+    )
+    failed = assess(ev=weak)
+    assert failed["decision"] == "FAIL"
+    assert failed["catalyst_confidence"] == 0.2
+    assert failed["score_components"]["catalyst_confidence"] == 0.06
+
+    result = unavailable(proposal(), AssessmentPolicy())
+    assert "catalyst_confidence" not in result
+
+
+def test_raw_zero_catalyst_confidence_is_preserved_when_assessment_fails():
+    zero = evidence()
+    zero = replace(
+        zero,
+        features=zero.features.model_copy(update={"catalyst_confidence": Decimal("0")}),
+    )
+    failed = assess(ev=zero)
+    assert failed["decision"] == "FAIL"
+    assert failed["catalyst_confidence"] == 0
+    assert failed["score_components"]["catalyst_confidence"] == 0
 
 
 def test_proposal_fingerprint_matches_go_contract_and_normalizes_default_ratio_and_decimal():

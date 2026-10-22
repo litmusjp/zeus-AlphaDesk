@@ -35,12 +35,21 @@ ADVISORY_POLICY_HASH = sha256(
 
 
 def _score_metadata(features: Any) -> dict[str, Any]:
-    return {
+    metadata: dict[str, Any] = {
         "score_profile": SCORE_PROFILE,
         "score_components": {
             name: float(value) for name, value in score_components(features).items()
         },
     }
+    confidence = getattr(features, "catalyst_confidence", None)
+    if confidence is not None:
+        try:
+            numeric = float(confidence)
+        except (TypeError, ValueError, OverflowError):
+            numeric = None
+        if numeric is not None and 0 <= numeric <= 1:
+            metadata["catalyst_confidence"] = numeric
+    return metadata
 
 
 class TradeLeg(BaseModel):
