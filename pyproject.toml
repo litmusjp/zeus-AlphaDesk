@@ -54,6 +54,9 @@ filterwarnings = [
   "ignore:websockets.legacy is deprecated:DeprecationWarning:websockets.legacy",
 ]
 
+[tool.uv]
+constraint-dependencies = ["msgpack==1.2.3"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
