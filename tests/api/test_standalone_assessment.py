@@ -365,7 +365,7 @@ def test_standalone_score_override_is_route_scoped_and_policy_bound():
     check_codes = [check["code"] for check in result["checks"]]
     assert check_codes.count("minimum_signal_score") == 1
     assert "score_below_threshold" not in check_codes
-    assert "policy_loss" in result["blocking_reasons"]
+    assert "policy_loss" not in result["blocking_reasons"]
     assert "price_action_not_confirming" in result["blocking_reasons"]
     assert stored_policy == {
         "minimum_signal_score": "35",

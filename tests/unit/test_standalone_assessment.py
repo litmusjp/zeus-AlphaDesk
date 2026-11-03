@@ -307,23 +307,19 @@ def test_neutral_rising_signal_matches_bullish_score_tie_break_in_assessment():
     assert checks["policy_loss"]["passed"] is True
 
 
-def test_risk_budget_is_measured_on_proposed_debit_and_total_quantity():
+def test_standalone_sizing_is_delegated_to_the_caller_not_capped():
     result = assess(proposal(quantity=10))
-    assert result["decision"] == "FAIL"
     assert result["signal_score"] is not None
-    assert any(not c["passed"] and "loss" in c["code"] for c in result["checks"])
+    checks = {c["code"]: c for c in result["checks"]}
+    for code in ("policy_loss", "policy_quantity"):
+        assert checks[code]["passed"] is True
+        assert checks[code]["threshold"] == "delegated_to_caller"
+    assert not any(not c["passed"] and "loss" in c["code"] for c in result["checks"])
 
 
 @pytest.mark.parametrize(
     ("trade", "policy", "check_code", "actual", "required"),
     [
-        (
-            proposal(quantity=10, limit_price="2.49"),
-            AssessmentPolicy(max_investment_per_candidate=Decimal("1000")),
-            "policy_loss",
-            "2490",
-            "1000",
-        ),
         (
             proposal(),
             AssessmentPolicy(
@@ -361,12 +357,8 @@ def test_failed_policy_check_remediation_explains_failure(
     assert actual in result["remediation"][result["blocking_reasons"].index(check_code)]
     assert required in result["remediation"][result["blocking_reasons"].index(check_code)]
     remediation = result["remediation"][result["blocking_reasons"].index(check_code)]
-    if check_code == "policy_loss":
-        assert "Reduce the proposed debit" in remediation
-        assert "Maximum loss is within" not in remediation
-    else:
-        assert "trusted market signal does not meet" in remediation
-        assert "trusted market signal meets" not in remediation
+    assert "trusted market signal does not meet" in remediation
+    assert "trusted market signal meets" not in remediation
 
 
 def test_no_quote_depth_fails_without_inventing_a_size():

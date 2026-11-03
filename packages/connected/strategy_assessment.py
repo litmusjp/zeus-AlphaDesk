@@ -213,22 +213,29 @@ def assess_strategy(
             shape_reason,
         )
     )
+    # Standalone paper-advisory assessments leave position sizing to the caller's account
+    # limits (OP2 max position / deployed / open-position / daily-loss). The checks stay in
+    # the receipt, marked as delegated, so the receipt shape and validation are unchanged.
     checks.append(
         _check(
             "policy_loss",
-            request.max_loss <= policy.max_investment_per_candidate,
+            standalone or request.max_loss <= policy.max_investment_per_candidate,
             request.max_loss,
-            policy.max_investment_per_candidate,
-            "Maximum loss is within the workspace Candidate Assessment policy.",
+            "delegated_to_caller" if standalone else policy.max_investment_per_candidate,
+            "Position size is governed by the caller's account limits; not capped here."
+            if standalone
+            else "Maximum loss is within the workspace Candidate Assessment policy.",
         )
     )
     checks.append(
         _check(
             "policy_quantity",
-            request.quantity <= policy.maximum_contracts_per_candidate,
+            standalone or request.quantity <= policy.maximum_contracts_per_candidate,
             request.quantity,
-            policy.maximum_contracts_per_candidate,
-            "Quantity is within the workspace policy cap.",
+            "delegated_to_caller" if standalone else policy.maximum_contracts_per_candidate,
+            "Quantity is governed by the caller's account limits; not capped here."
+            if standalone
+            else "Quantity is within the workspace policy cap.",
         )
     )
     signal_quality = request.scope == "SIGNAL_QUALITY" or standalone
