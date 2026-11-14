@@ -294,13 +294,18 @@ def assess_strategy(
             if leg.bid + leg.ask
             else Decimal("999")
         )
+        # Standalone assessments report the observed spread and leave the numeric limit to the
+        # caller (OP2 owns the entry spread cap); only an unusable quote (non-positive bid or a
+        # crossed quote) fails here.
         checks.append(
             _check(
                 f"leg_{index}_quote",
-                leg.ask >= leg.bid and spread <= policy.execution_max_spread_ratio,
+                (leg.bid > 0 and leg.ask >= leg.bid)
+                if standalone
+                else (leg.ask >= leg.bid and spread <= policy.execution_max_spread_ratio),
                 spread,
-                policy.execution_max_spread_ratio,
-                "Direct provider quote evidence must be usable."
+                "delegated_to_caller" if standalone else policy.execution_max_spread_ratio,
+                "Direct provider quote evidence must be usable; the spread limit is the caller's."
                 if standalone
                 else "Caller-supplied quote evidence must be usable; AlphaDesk does not "
                 "independently verify it.",

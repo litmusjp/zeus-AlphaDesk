@@ -13,15 +13,18 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.option_economics import UNAVAILABLE, option_economics
 from packages.connected.strategy_assessment import (
     AssessmentLeg,
     StrategyAssessmentRequest,
     assess_strategy,
 )
-from packages.domain.workflow import NoTrade, Signal
+from packages.domain.workflow import Direction, NoTrade, Signal
 from packages.strategy.catalyst import CatalystMomentumStrategy, score_components, score_signal
 
-SCORE_PROFILE = "catalyst_momentum_v1"
+# v2: the direction is verified against the proposed option (neutral headlines no longer force
+# "bullish"); the numeric spread limit is the caller's; the receipt adds information-only blocks.
+SCORE_PROFILE = "catalyst_momentum_v2"
 ADVISORY_POLICY_PROFILE = "paper_advisory_greeks_v1"
 ADVISORY_POLICY_RULE = {
     "profile": ADVISORY_POLICY_PROFILE,
@@ -34,11 +37,36 @@ ADVISORY_POLICY_HASH = sha256(
 ).hexdigest()
 
 
-def _score_metadata(features: Any) -> dict[str, Any]:
+def proposed_direction(trade: TradeRequest) -> Direction:
+    """The direction the proposal itself states: calls are bullish, puts are bearish."""
+    match = _OCC.fullmatch(trade.legs[0].symbol)
+    return Direction.BULLISH if match is not None and match[3] == "C" else Direction.BEARISH
+
+
+def resolve_direction(features: Any, proposed: Direction) -> Direction:
+    """Headline sentiment decides when it has a sign; neutral headlines defer to the proposal.
+
+    There is never a "no direction" state: the resolved direction is used in the score, the strategy
+    evaluation, the confirmation text and the receipt.
+    """
+    if features.sentiment > 0:
+        return Direction.BULLISH
+    if features.sentiment < 0:
+        return Direction.BEARISH
+    return proposed
+
+
+def _sentiment_sign(features: Any) -> str:
+    if features.sentiment > 0:
+        return "positive"
+    return "negative" if features.sentiment < 0 else "neutral"
+
+
+def _score_metadata(features: Any, resolved: Direction | None = None) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "score_profile": SCORE_PROFILE,
         "score_components": {
-            name: float(value) for name, value in score_components(features).items()
+            name: float(value) for name, value in score_components(features, resolved).items()
         },
     }
     confidence = getattr(features, "catalyst_confidence", None)
@@ -112,6 +140,7 @@ def policy_metadata(policy: AssessmentPolicy) -> dict[str, Any]:
     )
     return {
         "scope": "TRADE_ASSESSMENT",
+        "score_profile": SCORE_PROFILE,
         "policy_version": "standalone-paper-advisory-v1:"
         + sha256(advisory_bytes.encode()).hexdigest(),
         "minimum_passing_score": str(policy.minimum_signal_score),
@@ -423,6 +452,8 @@ def evaluate(
         return unavailable(trade, policy, "stale_or_invalid_evidence", evidence)
     if evidence.spot <= 0:
         return unavailable(trade, policy, "underlying_price_missing", evidence)
+    proposed = proposed_direction(trade)
+    resolved = resolve_direction(evidence.features, proposed)
     if policy.execution_min_open_interest is not None and any(
         c.quote.open_interest is None for c in contracts.values()
     ):
@@ -430,16 +461,20 @@ def evaluate(
         result["market_data"]["source_quote_times"] = {
             symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
-        result["signal_score"] = float(score_signal(evidence.features))
-        result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
+        result["signal_score"] = float(score_signal(evidence.features, resolved))
+        result.update(
+            _score_metadata(evidence.features, resolved), evidence_as_of=min(times).isoformat()
+        )
         return result
     if any(c.quote.greeks is None for c in contracts.values()):
         result = unavailable(trade, policy, "option_greeks_missing", evidence)
         result["market_data"]["source_quote_times"] = {
             symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
-        result["signal_score"] = float(score_signal(evidence.features))
-        result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
+        result["signal_score"] = float(score_signal(evidence.features, resolved))
+        result.update(
+            _score_metadata(evidence.features, resolved), evidence_as_of=min(times).isoformat()
+        )
         return result
     greeks_source = evidence.greeks_source
     if (evidence.greeks_at is None) != (not greeks_source) or (
@@ -450,15 +485,17 @@ def evaluate(
         result["market_data"]["source_quote_times"] = {
             symbol: contract.quote.quoted_at.isoformat() for symbol, contract in contracts.items()
         }
-        result["signal_score"] = float(score_signal(evidence.features))
-        result.update(_score_metadata(evidence.features), evidence_as_of=min(times).isoformat())
+        result["signal_score"] = float(score_signal(evidence.features, resolved))
+        result.update(
+            _score_metadata(evidence.features, resolved), evidence_as_of=min(times).isoformat()
+        )
         return result
     if any(min(c.quote.bid_size, c.quote.ask_size) <= 0 for c in contracts.values()):
         result = unavailable(trade, policy, evidence=evidence)
         result.update(
             decision="FAIL",
-            signal_score=float(score_signal(evidence.features)),
-            **_score_metadata(evidence.features),
+            signal_score=float(score_signal(evidence.features, resolved)),
+            **_score_metadata(evidence.features, resolved),
             evidence_as_of=min(times).isoformat(),
             retryable=False,
             blocking_reasons=["quote_depth"],
@@ -519,7 +556,7 @@ def evaluate(
         observed_at=now,
         expires_at=expires,
     )
-    score = score_signal(evidence.features)
+    score = score_signal(evidence.features, resolved)
     strategy = CatalystMomentumStrategy(
         minimum_score=policy.minimum_signal_score,
         maximum_gap=policy.maximum_gap_percent,
@@ -533,7 +570,8 @@ def evaluate(
             features=evidence.features,
             score=score,
             source_versions={"market": "direct-alpaca-v1"},
-        )
+        ),
+        resolved,
     )
     direction = None if isinstance(idea, NoTrade) else idea.direction.value
     strategy_result = assess_strategy(
@@ -610,7 +648,7 @@ def evaluate(
         "required_and_confirmed"
         if policy.require_price_action_confirmation
         and evidence.features.price_momentum
-        * (Decimal("1") if evidence.features.sentiment >= 0 else Decimal("-1"))
+        * (Decimal("1") if resolved is Direction.BULLISH else Decimal("-1"))
         > 0
         else (
             "not_required_by_operator_policy"
@@ -671,7 +709,7 @@ def evaluate(
         **unavailable(trade, policy),
         "decision": decision,
         "signal_score": float(score),
-        **_score_metadata(evidence.features),
+        **_score_metadata(evidence.features, resolved),
         "evidence_as_of": min(times).isoformat(),
         "checks": checks,
         "blocking_reasons": [c["code"] for c in failed],
@@ -705,4 +743,38 @@ def evaluate(
     }
     if not policy.require_price_action_confirmation:
         receipt["price_action_confirmation"] = price_action_confirmation
+    # Information only, from evidence already held; none of this changes a check, score or decision.
+    receipt["direction_basis"] = {
+        "proposed": proposed.value,
+        "headline_sentiment": _sentiment_sign(evidence.features),
+        "resolved": resolved.value,
+    }
+    receipt["option_quotes"] = [
+        {
+            "symbol": leg.symbol,
+            "side": leg.side,
+            "bid": str(leg.bid),
+            "ask": str(leg.ask),
+            "bid_size": str(contracts[leg.symbol].quote.bid_size),
+            "ask_size": str(contracts[leg.symbol].quote.ask_size),
+            "quoted_at": leg.quoted_at.isoformat(),
+            "spread_ratio": (
+                str((leg.ask - leg.bid) / ((leg.ask + leg.bid) / Decimal("2")))
+                if leg.bid + leg.ask
+                else UNAVAILABLE
+            ),
+        }
+        for leg in legs
+    ]
+    receipt["option_economics"] = option_economics(
+        legs=list(trade.legs),
+        contracts=contracts,
+        spot=evidence.spot,
+        premium=trade.limit_price,
+        today=now.date(),
+        average_range_pct=getattr(evidence, "average_range_pct", None),
+    )
+    provenance = getattr(evidence, "provenance", None)
+    if provenance is not None:
+        receipt["evidence_provenance"] = provenance
     return receipt

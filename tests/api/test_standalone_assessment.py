@@ -106,7 +106,7 @@ def test_standalone_endpoint_needs_no_watchlist_or_client_broker_account():
     assert result["market_data"]["quality"] == "testing_only"
     assert result["market_data"]["greeks_calculation_freshness"] == "unknown"
     assert result["signal_score"] is None
-    assert result["score_profile"] == "catalyst_momentum_v1"
+    assert result["score_profile"] == "catalyst_momentum_v2"
     assert result["score_components"] is None
     assert result["evidence_as_of"] is None
     assert "catalyst_confidence" not in result
@@ -137,7 +137,7 @@ def test_on_demand_evidence_passes_for_never_scanned_symbol():
     assert result["blocking_reasons"] == []
     assert result["trade_fingerprint"]
     assert result["expires_at"]
-    assert result["score_profile"] == "catalyst_momentum_v1"
+    assert result["score_profile"] == "catalyst_momentum_v2"
     assert result["score_components"]
     assert result["catalyst_confidence"] == 0.9
     assert result["evidence_as_of"] == provider.evidence.features_at.isoformat()

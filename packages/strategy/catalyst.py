@@ -18,9 +18,18 @@ def _clamp(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
     return min(max(value, low), high)
 
 
-def score_components(features: CatalystFeatures) -> dict[str, Decimal]:
-    """Return the existing weighted catalyst/momentum score contributions."""
-    direction = Decimal("1") if features.sentiment >= 0 else Decimal("-1")
+def score_components(
+    features: CatalystFeatures, resolved_direction: Direction | None = None
+) -> dict[str, Decimal]:
+    """Return the existing weighted catalyst/momentum score contributions.
+
+    `resolved_direction` is given only by the standalone assessment, which resolves the direction
+    before scoring. Every other caller keeps the original rule (non-negative sentiment is bullish).
+    """
+    if resolved_direction is None:
+        direction = Decimal("1") if features.sentiment >= 0 else Decimal("-1")
+    else:
+        direction = Decimal("1") if resolved_direction is Direction.BULLISH else Decimal("-1")
     directional_momentum = _clamp(features.price_momentum * direction, Decimal("-1"), Decimal("1"))
     directional_market = _clamp(
         features.market_confirmation * direction, Decimal("-1"), Decimal("1")
@@ -42,8 +51,10 @@ def score_components(features: CatalystFeatures) -> dict[str, Decimal]:
     }
 
 
-def score_signal(features: CatalystFeatures) -> Decimal:
-    components = score_components(features)
+def score_signal(
+    features: CatalystFeatures, resolved_direction: Direction | None = None
+) -> Decimal:
+    components = score_components(features, resolved_direction)
     normalized = (
         components["catalyst_confidence"]
         + components["sentiment"]
@@ -70,13 +81,17 @@ class CatalystMomentumStrategy:
         self._minimum_catalyst_confidence = minimum_catalyst_confidence
         self._require_price_action_confirmation = require_price_action_confirmation
 
-    def evaluate_signal(self, signal: Signal) -> TradeIdea | NoTrade:
+    def evaluate_signal(
+        self, signal: Signal, resolved_direction: Direction | None = None
+    ) -> TradeIdea | NoTrade:
         reasons: list[str] = []
         if signal.score < self._minimum_score:
             reasons.append("score_below_threshold")
         if abs(signal.features.gap_percent) > self._maximum_gap:
             reasons.append("move_excessively_extended")
-        direction = Direction.BULLISH if signal.features.sentiment >= 0 else Direction.BEARISH
+        direction = resolved_direction or (
+            Direction.BULLISH if signal.features.sentiment >= 0 else Direction.BEARISH
+        )
         directional_momentum = signal.features.price_momentum * (
             Decimal("1") if direction is Direction.BULLISH else Decimal("-1")
         )

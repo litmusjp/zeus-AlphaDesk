@@ -18,6 +18,10 @@ from packages.domain.workflow import CatalystFeatures
 
 _HISTORICAL_SESSION_COUNT = 24
 _HISTORICAL_LOOKBACK_DAYS = 60
+_RANGE_SESSION_COUNT = 20
+STOCK_FEED = "iex"
+NEWS_WINDOW_HOURS = 36
+NEWS_LIMIT = 20
 
 
 class EvidenceUnavailable(Exception):
@@ -36,6 +40,10 @@ class TradeEvidence:
     greeks_source: str | None = None
     market_data_feed: str = "indicative"
     market_data_quality: str = "testing_only"
+    # Information only: the 20-session average high-low range (percent of the close) and where
+    # the stock and news evidence came from. Never an input to the score or to a decision.
+    average_range_pct: Decimal | None = None
+    provenance: dict[str, Any] | None = None
 
 
 def timestamp(value: Any) -> datetime:
@@ -55,7 +63,7 @@ def number(value: Any) -> Decimal:
     return parsed
 
 
-def features_from_observations(
+def _features_and_news_count(
     stocks: dict,
     bars: list[dict],
     news: list[dict],
@@ -64,7 +72,7 @@ def features_from_observations(
     *,
     calendar: list[dict] | None = None,
     now: datetime | None = None,
-) -> tuple[CatalystFeatures, Decimal, datetime]:
+) -> tuple[CatalystFeatures, Decimal, datetime, int]:
     """Existing catalyst feature transformations, but with real source timestamps and liquidity."""
     now = now or datetime.now(UTC)
     market_zone = ZoneInfo("America/New_York")
@@ -200,7 +208,35 @@ def features_from_observations(
         ),
         price,
         observed,
+        len(eligible_news),
     )
+
+
+def features_from_observations(
+    stocks: dict[str, Any],
+    bars: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    underlying: str,
+    liquidity: Decimal,
+    *,
+    calendar: list[dict[str, Any]] | None = None,
+    now: datetime | None = None,
+) -> tuple[CatalystFeatures, Decimal, datetime]:
+    """Existing catalyst feature transformations, but with real source timestamps and liquidity."""
+    features, price, observed, _eligible = _features_and_news_count(
+        stocks, bars, news, underlying, liquidity, calendar=calendar, now=now
+    )
+    return features, price, observed
+
+
+def average_range_percent(bars: list[dict[str, Any]]) -> Decimal | None:
+    """Mean of (high - low) / close in percent over the most recent completed sessions, or None."""
+    try:
+        recent = sorted(bars, key=lambda bar: str(bar["t"]), reverse=True)[:_RANGE_SESSION_COUNT]
+        ranges = [(number(b["h"]) - number(b["l"])) / number(b["c"]) * 100 for b in recent]
+        return sum(ranges, Decimal(0)) / Decimal(len(ranges)) if ranges else None
+    except (KeyError, TypeError, ValueError, ArithmeticError, EvidenceUnavailable):
+        return None
 
 
 class DirectEvidenceProvider:
@@ -264,7 +300,7 @@ class DirectEvidenceProvider:
             stocks, history, headlines, snapshots, calendar, *references = await asyncio.gather(
                 get(
                     "https://data.alpaca.markets/v2/stocks/snapshots",
-                    {"symbols": ",".join(sorted({underlying, "SPY", "QQQ"})), "feed": "iex"},
+                    {"symbols": ",".join(sorted({underlying, "SPY", "QQQ"})), "feed": STOCK_FEED},
                 ),
                 get(
                     "https://data.alpaca.markets/v2/stocks/bars",
@@ -275,16 +311,16 @@ class DirectEvidenceProvider:
                         "end": historical_end,
                         "limit": _HISTORICAL_SESSION_COUNT,
                         "sort": "desc",
-                        "feed": "iex",
+                        "feed": STOCK_FEED,
                     },
                 ),
                 get(
                     "https://data.alpaca.markets/v1beta1/news",
                     {
                         "symbols": underlying,
-                        "start": (now - timedelta(hours=36)).isoformat(),
+                        "start": (now - timedelta(hours=NEWS_WINDOW_HOURS)).isoformat(),
                         "end": now.isoformat(),
-                        "limit": 20,
+                        "limit": NEWS_LIMIT,
                         "include_content": "false",
                     },
                 ),
@@ -349,7 +385,7 @@ class DirectEvidenceProvider:
             )
             for c in contracts
         ]
-        features, spot, observed = features_from_observations(
+        features, spot, observed, eligible = _features_and_news_count(
             stocks,
             history["bars"][underlying],
             headlines["news"],
@@ -357,4 +393,25 @@ class DirectEvidenceProvider:
             Decimal(1) - max(spreads),
             calendar=calendar,
         )
-        return TradeEvidence(tuple(contracts), features, observed, spot)
+        returned = len(headlines["news"])
+        provenance = {
+            "stock_feed": STOCK_FEED,
+            "benchmark_feed": STOCK_FEED,
+            "benchmark_symbols": ["SPY", "QQQ"],
+            "news": {
+                "provider": "alpaca",
+                "window_hours": NEWS_WINDOW_HOURS,
+                "limit": NEWS_LIMIT,
+                "articles_returned": returned,
+                "articles_eligible": eligible,
+                "cap_reached": returned >= NEWS_LIMIT,
+            },
+        }
+        return TradeEvidence(
+            tuple(contracts),
+            features,
+            observed,
+            spot,
+            average_range_pct=average_range_percent(history["bars"][underlying]),
+            provenance=provenance,
+        )

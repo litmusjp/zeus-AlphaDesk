@@ -96,7 +96,7 @@ def test_pass_is_a_fresh_bound_assessment_never_order_authority():
     assert datetime.fromisoformat(result["expires_at"]) > NOW
     assert result["scope"] == "TRADE_ASSESSMENT"
     assert result["trade_fingerprint"] != assess(proposal(quantity=2))["trade_fingerprint"]
-    assert result["score_profile"] == "catalyst_momentum_v1"
+    assert result["score_profile"] == "catalyst_momentum_v2"
     assert result["score_components"] == {
         name: float(value) for name, value in score_components(evidence().features).items()
     }

@@ -75,7 +75,7 @@ async def test_new_tool_calls_the_same_api_through_real_mcp_protocol(monkeypatch
                 "warnings": ["greek_calculation_time_unknown"],
                 "source_quote_times": {"AAPL261106C00200000": now.isoformat()},
             },
-            "score_profile": "catalyst_momentum_v1",
+            "score_profile": "catalyst_momentum_v2",
             "score_components": {
                 name: float(value) for name, value in score_components(features).items()
             },
