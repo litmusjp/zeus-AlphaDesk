@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from packages.connected.assessment_policy import AssessmentPolicy
-from packages.domain.workflow import CatalystFeatures
+from packages.domain.workflow import CatalystFeatures, Direction
 from packages.strategy.catalyst import score_signal
 
 
@@ -199,6 +199,7 @@ def assess_strategy(
     trusted_score_observed_at: datetime | None = None,
     trusted_signal_direction: str | None = None,
     standalone: bool = False,
+    resolved_direction: Direction | None = None,
 ) -> StrategyAssessmentResult:
     current = now or datetime.now(UTC)
     age = Decimal(str((current - request.market_evidence_at).total_seconds()))
@@ -402,7 +403,11 @@ def assess_strategy(
         if request.is_external or standalone
         else (request.market_evidence_at if request.market_scanner_features is not None else None)
     )
-    calculated_signal_score = score_signal(score_features) if score_features is not None else None
+    # The standalone assessment resolves the direction before scoring; the minimum-score check
+    # judges the same score the receipt reports, not one recomputed with the old direction rule.
+    calculated_signal_score = (
+        score_signal(score_features, resolved_direction) if score_features is not None else None
+    )
     market_scanner_signal_score = calculated_signal_score
     if request.is_external or standalone:
         score_ready = (

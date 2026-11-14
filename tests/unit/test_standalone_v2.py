@@ -571,3 +571,61 @@ def test_the_provenance_block_is_reported_when_the_evidence_carries_it():
     assert result["option_economics"]["range_proxy"] != UNAVAILABLE
     without = evaluate(trade_for(CALL), POLICY, evidence_for(CALL, features(".8", ".5")), now=NOW)
     assert "evidence_provenance" not in without
+
+
+# ── the minimum-score check judges the receipt's own (resolved-direction) score ─────────────────
+
+
+def test_the_minimum_score_check_uses_the_same_score_the_receipt_reports():
+    # Neutral headlines, a put, price below the open. The resolved (bearish) score is 74.5;
+    # recomputing with the old rule (non-negative sentiment = bullish) gives 52.5 and fails 60.
+    policy = POLICY.model_copy(
+        update={
+            "minimum_signal_score": Decimal("60"),
+            "pre_scan_minimum_signal_score": Decimal("50"),
+        }
+    )
+    feats = features("0", "-.5", bearish_market=True)
+    result = evaluate(trade_for(PUT), policy, evidence_for(PUT, feats), now=NOW)
+    assert result["signal_score"] == pytest.approx(74.5)
+    assert score_signal(feats) < Decimal("60") < score_signal(feats, Direction.BEARISH)
+    assert result["decision"] == "PASS", result["blocking_reasons"]
+    by_code = {c["code"]: c for c in result["checks"]}
+    assert Decimal(by_code["minimum_signal_score"]["actual"]) == Decimal(
+        str(result["signal_score"])
+    )
+    assert Decimal(by_code["direct_signal_evidence"]["actual"]) == Decimal(
+        str(result["signal_score"])
+    )
+    assert by_code["minimum_signal_score"]["passed"] is True
+
+
+def test_a_score_below_the_floor_still_fails_with_the_receipts_own_score():
+    policy = POLICY.model_copy(
+        update={
+            "minimum_signal_score": Decimal("90"),
+            "pre_scan_minimum_signal_score": Decimal("50"),
+        }
+    )
+    result = evaluate(
+        trade_for(PUT),
+        policy,
+        evidence_for(PUT, features("0", "-.5", bearish_market=True)),
+        now=NOW,
+    )
+    assert result["decision"] == "FAIL"
+    failed_checks = {c["code"]: c for c in result["checks"] if not c["passed"]}
+    assert Decimal(failed_checks["minimum_signal_score"]["actual"]) == Decimal(
+        str(result["signal_score"])
+    )
+
+
+def test_a_call_with_positive_headlines_scores_the_same_as_before():
+    # Where the headline sign and the proposal agree nothing changed: both scores are equal.
+    feats = features(".8", ".5")
+    assert score_signal(feats) == score_signal(feats, Direction.BULLISH)
+    result = evaluate(trade_for(CALL), POLICY, evidence_for(CALL, feats), now=NOW)
+    by_code = {c["code"]: c for c in result["checks"]}
+    assert Decimal(by_code["minimum_signal_score"]["actual"]) == Decimal(
+        str(result["signal_score"])
+    )

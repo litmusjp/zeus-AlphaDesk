@@ -585,6 +585,7 @@ def evaluate(
         trusted_score_observed_at=evidence.features_at,
         trusted_signal_direction=direction,
         standalone=True,
+        resolved_direction=resolved,
     )
     checks = []
     for original in strategy_result.checks:
