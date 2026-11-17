@@ -258,9 +258,10 @@ class AssessmentPolicy(BaseModel):
     def normalize_allowed_structures(cls, value: object) -> tuple[str, ...]:
         if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
             raise ValueError("allowed_structures must be a list of structure names")
-        names = [getattr(item, "value", item) for item in value]
-        if not names or any(not isinstance(name, str) for name in names):
+        raw = [getattr(item, "value", item) for item in value]
+        if not raw or any(not isinstance(name, str) for name in raw):
             raise ValueError("allowed_structures must name at least one structure")
+        names: list[str] = [name for name in raw if isinstance(name, str)]
         unknown = sorted(set(names) - set(STRUCTURE_ORDER))
         if unknown:
             raise ValueError(f"unknown structure(s): {', '.join(unknown)}")

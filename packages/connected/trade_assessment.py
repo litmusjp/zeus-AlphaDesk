@@ -637,7 +637,10 @@ def _new_structure_fields(
     now: datetime,
 ) -> dict[str, Any]:
     """Receipt fields that exist ONLY for the four newly assessable structures."""
-    fields: dict[str, Any] = {"structure_type": structure.value, "price_kind": price_kind(structure)}
+    fields: dict[str, Any] = {
+        "structure_type": structure.value,
+        "price_kind": price_kind(structure),
+    }
     summary = _structure_summary(trade, structure, contracts)
     if summary is not None:
         fields["max_loss"] = str(summary.max_loss)
@@ -645,7 +648,10 @@ def _new_structure_fields(
         fields["break_evens"] = [str(value) for value in summary.break_evens]
         fields["position_greeks"] = {
             "unit": "per position: greek x quantity x multiplier, plus declared shares for delta",
-            **{name: str(getattr(summary.greeks, name)) for name in ("delta", "gamma", "theta", "vega")},
+            **{
+                name: str(getattr(summary.greeks, name))
+                for name in ("delta", "gamma", "theta", "vega")
+            },
         }
     else:
         fields.update(max_loss=UNAVAILABLE, max_profit=UNAVAILABLE, break_evens=UNAVAILABLE)
@@ -750,10 +756,16 @@ def _evaluate_protective(
             )
         )
         for name in greeks:
-            greeks[name] += getattr(q.greeks, name) * trade.quantity * (1 if leg.side == "buy" else -1)
+            greeks[name] += (
+                getattr(q.greeks, name) * trade.quantity * (1 if leg.side == "buy" else -1)
+            )
     legs.sort(key=lambda leg: leg.side != "buy")
     underlying = next(iter(contracts.values())).underlying_symbol
-    summary = _structure_summary(trade, structure, contracts) if stock.shares == trade.quantity * 100 else None
+    summary = (
+        _structure_summary(trade, structure, contracts)
+        if stock.shares == trade.quantity * 100
+        else None
+    )
     request = StrategyAssessmentRequest(
         underlying_symbol=underlying,
         strategy_type=structure.value.upper(),
@@ -761,7 +773,9 @@ def _evaluate_protective(
         quantity=trade.quantity,
         limit_price=trade.limit_price,
         legs=tuple(legs),
-        max_loss=summary.max_loss if summary is not None else trade.limit_price * trade.quantity * 100,
+        max_loss=summary.max_loss
+        if summary is not None
+        else trade.limit_price * trade.quantity * 100,
         greeks=greeks,
         market_evidence_at=min(times),
         observed_at=now,

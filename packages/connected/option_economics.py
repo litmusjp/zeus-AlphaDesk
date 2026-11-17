@@ -174,8 +174,15 @@ def credit_economics(
         is_call = short_contract.option_type == "call"
         selected = [short_contract, long_contract]
     except (StopIteration, KeyError, AttributeError, TypeError):
-        for name in ("width", "max_profit", "max_loss", "expiry_break_even", "spread_cost_pct",
-                     "net_theta_per_day_per_share", "days_to_expiry"):
+        for name in (
+            "width",
+            "max_profit",
+            "max_loss",
+            "expiry_break_even",
+            "spread_cost_pct",
+            "net_theta_per_day_per_share",
+            "days_to_expiry",
+        ):
             block[name] = UNAVAILABLE
         return block
     width = abs(short_contract.strike - long_contract.strike)
@@ -224,8 +231,13 @@ def protective_economics(
         short = next((leg for leg in legs if leg.side == "sell"), None)
         selected = [contracts[leg.symbol] for leg in legs]
     except (StopIteration, KeyError, AttributeError, TypeError):
-        for name in ("floor_strike", "cost_pct_of_stock_value", "expiry_break_even",
-                     "net_theta_per_day_per_share", "days_to_expiry"):
+        for name in (
+            "floor_strike",
+            "cost_pct_of_stock_value",
+            "expiry_break_even",
+            "net_theta_per_day_per_share",
+            "days_to_expiry",
+        ):
             block[name] = UNAVAILABLE
         return block
     block["floor_strike"] = _guard(lambda: long_contract.strike)
