@@ -4,8 +4,9 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from packages.connected.trade_structure import DEFAULT_ALLOWED_STRUCTURES, STRUCTURE_ORDER
 from packages.domain.broker import BrokerPosition
 from packages.risk.engine import RiskPolicy
 
@@ -241,6 +242,29 @@ class AssessmentPolicy(BaseModel):
     max_abs_portfolio_gamma: Decimal = Field(default=Decimal("1000"), gt=0, le=Decimal("1000000"))
     max_abs_portfolio_theta: Decimal = Field(default=Decimal("1000"), gt=0, le=Decimal("1000000"))
     max_abs_portfolio_vega: Decimal = Field(default=Decimal("5000"), gt=0, le=Decimal("1000000"))
+    # Standalone assessment structures (Phase B, dark release). The four defaults are the shapes
+    # that were assessable before; the others stay off until a separately approved change.
+    # Every key below is OMITTED from the policy snapshot/digest while it equals its default
+    # (see `policy_metadata`), so existing receipts and OP2's digest check do not move.
+    allowed_structures: tuple[str, ...] = DEFAULT_ALLOWED_STRUCTURES
+    credit_min_credit_to_width: Decimal = Field(default=Decimal("0.25"), gt=0, lt=1)
+    credit_max_short_delta: Decimal = Field(default=Decimal("0.30"), gt=0, le=1)
+    credit_dte_min: int = Field(default=14, ge=1, le=365)
+    credit_dte_max: int = Field(default=60, ge=1, le=365)
+    protective_max_premium_pct: Decimal = Field(default=Decimal("5"), gt=0, le=100)
+
+    @field_validator("allowed_structures", mode="before")
+    @classmethod
+    def normalize_allowed_structures(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+            raise ValueError("allowed_structures must be a list of structure names")
+        names = [getattr(item, "value", item) for item in value]
+        if not names or any(not isinstance(name, str) for name in names):
+            raise ValueError("allowed_structures must name at least one structure")
+        unknown = sorted(set(names) - set(STRUCTURE_ORDER))
+        if unknown:
+            raise ValueError(f"unknown structure(s): {', '.join(unknown)}")
+        return tuple(name for name in STRUCTURE_ORDER if name in set(names))
 
     @model_validator(mode="after")
     def validate_ranges(self, info: ValidationInfo) -> AssessmentPolicy:
@@ -257,6 +281,8 @@ class AssessmentPolicy(BaseModel):
             raise ValueError("pre-scan catalyst confidence cannot be stricter than execution")
         if self.maximum_dte < self.minimum_dte:
             raise ValueError("maximum_dte must be greater than or equal to minimum_dte")
+        if self.credit_dte_max < self.credit_dte_min:
+            raise ValueError("credit_dte_max must be greater than or equal to credit_dte_min")
         if self.execution_max_spread_ratio > self.pre_scan_max_spread_ratio:
             raise ValueError("execution spread ratio cannot be looser than pre-scan")
         if self.execution_max_quote_age_seconds > self.pre_scan_max_quote_age_seconds:

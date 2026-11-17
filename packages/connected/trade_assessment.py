@@ -13,18 +13,42 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from packages.connected.assessment_policy import AssessmentPolicy
-from packages.connected.option_economics import UNAVAILABLE, option_economics
+from packages.connected.option_economics import (
+    UNAVAILABLE,
+    credit_economics,
+    option_economics,
+    protective_economics,
+)
 from packages.connected.strategy_assessment import (
     AssessmentLeg,
     StrategyAssessmentRequest,
     assess_strategy,
 )
+from packages.connected.trade_structure import (
+    CREDIT_STRUCTURES,
+    PROTECTIVE_STRUCTURES,
+    classify_shape,
+    gate_structure,
+    price_kind,
+    structure_direction,
+)
+from packages.domain.options import (
+    LegSide,
+    OptionLeg,
+    OptionStructure,
+    StructureType,
+    UnderlyingLeg,
+)
 from packages.domain.workflow import Direction, NoTrade, Signal
+from packages.options.engine import InvalidOptionStructure, build_structure
 from packages.strategy.catalyst import CatalystMomentumStrategy, score_components, score_signal
 
 # v2: the direction is verified against the proposed option (neutral headlines no longer force
 # "bullish"); the numeric spread limit is the caller's; the receipt adds information-only blocks.
 SCORE_PROFILE = "catalyst_momentum_v2"
+# Protective structures are not catalyst-scored: no score, no components, and "is a hedge
+# appropriate" is delegated to the caller. Unchanged OP2 cannot validate this profile (by design).
+PROTECTIVE_PROFILE = "protective_structure_v1"
 ADVISORY_POLICY_PROFILE = "paper_advisory_greeks_v1"
 ADVISORY_POLICY_RULE = {
     "profile": ADVISORY_POLICY_PROFILE,
@@ -38,7 +62,11 @@ ADVISORY_POLICY_HASH = sha256(
 
 
 def proposed_direction(trade: TradeRequest) -> Direction:
-    """The direction the proposal itself states: calls are bullish, puts are bearish."""
+    """The direction the proposal itself states, from its structure (credit puts are bullish)."""
+    structure = classify_shape(trade)
+    derived = structure_direction(structure) if structure is not None else None
+    if derived is not None:
+        return derived
     match = _OCC.fullmatch(trade.legs[0].symbol)
     return Direction.BULLISH if match is not None and match[3] == "C" else Direction.BEARISH
 
@@ -87,12 +115,26 @@ class TradeLeg(BaseModel):
     ratio_quantity: int = Field(default=1, ge=1, le=10, strict=True)
 
 
+class StockContext(BaseModel):
+    """Shares the caller declares it holds, for protective structures only.
+
+    Caller-declared, NOT verified against any broker account. `entry_price` is the cost basis
+    per share.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    symbol: str = Field(pattern=r"^[A-Z0-9]{1,6}$")
+    shares: int = Field(ge=1, le=100_000, strict=True)
+    entry_price: Decimal = Field(gt=0)
+
+
 class TradeRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
     legs: tuple[TradeLeg, ...] = Field(min_length=1, max_length=2)
     quantity: int = Field(ge=1, le=10, strict=True)
     limit_price: Decimal = Field(gt=0)
     client_reference: str | None = Field(default=None, max_length=128)
+    stock_context: StockContext | None = None
 
     @field_validator("client_reference")
     @classmethod
@@ -100,6 +142,12 @@ class TradeRequest(BaseModel):
         if value is not None and len(value.encode("utf-8")) > 128:
             raise ValueError("client_reference exceeds 128 UTF-8 bytes")
         return value
+
+
+def trade_wire(trade: TradeRequest) -> dict[str, Any]:
+    """The `trade` echo. `stock_context` appears ONLY when it was sent: a null key would break
+    OP2's strict decoder for every existing shape."""
+    return trade.model_dump(mode="json", exclude=None if trade.stock_context else {"stock_context"})
 
 
 def _canonical_decimal(value: Decimal) -> str:
@@ -123,7 +171,25 @@ def proposal_fingerprint(trade: TradeRequest) -> str:
         f"standalone-proposal-v2|q:{trade.quantity}|p:{_canonical_decimal(trade.limit_price)}|"
         f"r:{reference_field}|n:{len(trade.legs)}|{legs}"
     )
+    stock = trade.stock_context
+    if stock is not None:
+        # v3 (protective structures only): the v2 string with the declared shares appended.
+        canonical = canonical.replace("standalone-proposal-v2", "standalone-proposal-v3", 1)
+        canonical += (
+            f"|s:{len(stock.symbol)}:{stock.symbol}:{stock.shares}:"
+            f"{_canonical_decimal(stock.entry_price)}"
+        )
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_PHASE_B_POLICY_KEYS = (
+    "allowed_structures",
+    "credit_min_credit_to_width",
+    "credit_max_short_delta",
+    "credit_dte_min",
+    "credit_dte_max",
+    "protective_max_premium_pct",
+)
 
 
 def policy_metadata(policy: AssessmentPolicy) -> dict[str, Any]:
@@ -132,6 +198,10 @@ def policy_metadata(policy: AssessmentPolicy) -> dict[str, Any]:
     # OFF is explicit in the snapshot and changes the effective policy fingerprint.
     if policy.require_price_action_confirmation:
         snapshot.pop("require_price_action_confirmation")
+    # Phase B keys are omitted at their defaults so existing snapshots and digests do not move.
+    for key in _PHASE_B_POLICY_KEYS:
+        if getattr(policy, key) == AssessmentPolicy.model_fields[key].default:
+            snapshot.pop(key, None)
     advisory_bytes = json.dumps(
         {"workspace_policy": snapshot, **ADVISORY_POLICY_RULE},
         sort_keys=True,
@@ -144,12 +214,7 @@ def policy_metadata(policy: AssessmentPolicy) -> dict[str, Any]:
         "policy_version": "standalone-paper-advisory-v1:"
         + sha256(advisory_bytes.encode()).hexdigest(),
         "minimum_passing_score": str(policy.minimum_signal_score),
-        "supported_strategies": [
-            "long_call",
-            "long_put",
-            "bull_call_debit_spread",
-            "bear_put_debit_spread",
-        ],
+        "supported_strategies": list(policy.allowed_structures),
         "policy_snapshot": snapshot,
         "execution_allowed": False,
         "advisory_policy_profile": ADVISORY_POLICY_PROFILE,
@@ -382,6 +447,9 @@ def unavailable(
 _OCC = re.compile(r"^([A-Z0-9]{1,6})(\d{6})([CP])(\d{8})$")
 
 
+_DEFAULT_ALLOWLIST_POLICY = AssessmentPolicy()
+
+
 def _spread_strategy_type(
     symbol: str,
 ) -> Literal["BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD"]:
@@ -392,34 +460,461 @@ def _spread_strategy_type(
 
 
 def supported_shape(trade: TradeRequest) -> bool:
-    matches = [_OCC.fullmatch(leg.symbol) for leg in trade.legs]
-    if any(match is None for match in matches):
-        return False
-    valid_matches = [match for match in matches if match is not None]
-    if any(leg.ratio_quantity != 1 for leg in trade.legs):
-        return False
-    if len(trade.legs) == 1:
-        return trade.legs[0].side == "buy"
-    if len({leg.symbol for leg in trade.legs}) != 2:
-        return False
-    if len({(m[1], m[2], m[3]) for m in valid_matches}) != 1:
-        return False
-    long = next(
-        (m for leg, m in zip(trade.legs, valid_matches, strict=True) if leg.side == "buy"), None
+    """Legacy predicate: one of the four shapes that were assessable before the allowlist."""
+    return gate_structure(trade, _DEFAULT_ALLOWLIST_POLICY) is not None
+
+
+def _convert_checks(strategy_result: Any) -> list[dict[str, Any]]:
+    checks = []
+    for original in strategy_result.checks:
+        c = original.model_dump(mode="json")
+        message = c["reason"]
+        if not c["passed"] and c["code"] == "policy_loss":
+            message = (
+                "Reduce the proposed debit or quantity until maximum planned loss is "
+                "within the workspace limit."
+            )
+        elif not c["passed"] and c["code"] == "minimum_signal_score":
+            message = (
+                "The trusted market signal does not meet the workspace minimum score; "
+                "wait for stronger verified evidence."
+            )
+        checks.append(
+            {
+                "code": c["code"],
+                "passed": c["passed"],
+                "actual": c["actual"],
+                "threshold": c["limit"],
+                "message": message,
+            }
+        )
+    return checks
+
+
+def _add_leg_checks(
+    check: Any,
+    trade: TradeRequest,
+    contracts: dict[str, Any],
+    policy: AssessmentPolicy,
+    spot: Decimal,
+    now: datetime,
+) -> None:
+    for leg in trade.legs:
+        c = contracts[leg.symbol]
+        dte = (c.expiration - now.date()).days
+        check(
+            f"{leg.symbol}_tradable",
+            c.tradable,
+            c.tradable,
+            True,
+            "Choose a currently tradable standard contract.",
+        )
+        check(
+            f"{leg.symbol}_dte",
+            policy.minimum_dte <= dte <= policy.maximum_dte,
+            dte,
+            f"{policy.minimum_dte}..{policy.maximum_dte}",
+            "Choose an expiry within the permitted DTE range.",
+        )
+        distance = abs(c.strike - spot) / spot
+        check(
+            f"{leg.symbol}_strike_distance",
+            distance <= policy.maximum_strike_distance_ratio,
+            distance,
+            policy.maximum_strike_distance_ratio,
+            "Choose a strike within the permitted distance from the underlying.",
+        )
+
+
+def _effective_credit_dte_window(policy: AssessmentPolicy) -> tuple[int, int]:
+    """The credit window intersected with the workspace window; the receipt states what was used."""
+    return (
+        max(policy.minimum_dte, policy.credit_dte_min),
+        min(policy.maximum_dte, policy.credit_dte_max),
     )
-    short = next(
-        (m for leg, m in zip(trade.legs, valid_matches, strict=True) if leg.side == "sell"), None
+
+
+def _add_credit_checks(
+    check: Any,
+    trade: TradeRequest,
+    structure: StructureType,
+    contracts: dict[str, Any],
+    policy: AssessmentPolicy,
+    spot: Decimal,
+    now: datetime,
+) -> None:
+    short = contracts[next(leg.symbol for leg in trade.legs if leg.side == "sell")]
+    long = contracts[next(leg.symbol for leg in trade.legs if leg.side == "buy")]
+    width = abs(short.strike - long.strike)
+    credit = trade.limit_price
+    check(
+        "credit_below_width",
+        credit < width,
+        credit,
+        width,
+        "The proposed net credit must be less than the spread width.",
     )
-    if long is None or short is None:
-        return False
-    return int(long[4]) < int(short[4]) if long[3] == "C" else int(long[4]) > int(short[4])
+    ratio = credit / width if width > 0 else Decimal(0)
+    check(
+        "credit_to_width_minimum",
+        ratio >= policy.credit_min_credit_to_width,
+        ratio,
+        policy.credit_min_credit_to_width,
+        "Ask for a larger credit relative to the width, or choose a different spread.",
+    )
+    delta = short.quote.greeks.delta if short.quote.greeks else None
+    check(
+        "short_leg_delta_maximum",
+        delta is not None and abs(delta) <= policy.credit_max_short_delta,
+        "unavailable" if delta is None else abs(delta),
+        policy.credit_max_short_delta,
+        "Choose a short strike with a smaller absolute delta.",
+    )
+    out_of_the_money = (
+        short.strike < spot
+        if structure is StructureType.BULL_PUT_CREDIT_SPREAD
+        else short.strike > spot
+    )
+    check(
+        "short_strike_out_of_the_money",
+        out_of_the_money,
+        short.strike,
+        f"{'below' if structure is StructureType.BULL_PUT_CREDIT_SPREAD else 'above'} {spot}",
+        "The short strike must be out of the money.",
+    )
+    low, high = _effective_credit_dte_window(policy)
+    dte = (short.expiration - now.date()).days
+    check(
+        "credit_dte_window",
+        low <= dte <= high,
+        dte,
+        f"{low}..{high}",
+        "Choose an expiry inside the credit-spread window (intersected with the workspace window).",
+    )
+
+
+def _structure_summary(
+    trade: TradeRequest, structure: StructureType, contracts: dict[str, Any]
+) -> OptionStructure | None:
+    """Payoff numbers come from the engine; this only maps the request onto it."""
+    sells = [leg for leg in trade.legs if leg.side == "sell"]
+    buys = [leg for leg in trade.legs if leg.side == "buy"]
+    limit = trade.limit_price
+    entries: dict[str, Decimal] = {}
+    if structure in CREDIT_STRUCTURES:
+        ask = contracts[buys[0].symbol].quote.ask
+        entries = {buys[0].symbol: ask, sells[0].symbol: ask + limit}
+    elif sells:
+        bid = contracts[sells[0].symbol].quote.bid
+        entries = {buys[0].symbol: limit + bid, sells[0].symbol: bid}
+    else:
+        entries = {buys[0].symbol: limit}
+    legs = tuple(
+        OptionLeg(
+            contract=contracts[leg.symbol],
+            side=LegSide.LONG if leg.side == "buy" else LegSide.SHORT,
+            entry_price=entries[leg.symbol],
+        )
+        for leg in trade.legs
+    )
+    stock = trade.stock_context
+    underlying = (
+        UnderlyingLeg(symbol=stock.symbol, shares=stock.shares, entry_price=stock.entry_price)
+        if stock is not None and structure in PROTECTIVE_STRUCTURES
+        else None
+    )
+    try:
+        return build_structure(structure, legs, quantity=trade.quantity, underlying=underlying)
+    except (InvalidOptionStructure, ValueError):
+        return None
+
+
+def _new_structure_fields(
+    trade: TradeRequest,
+    structure: StructureType,
+    contracts: dict[str, Any],
+    policy: AssessmentPolicy,
+    now: datetime,
+) -> dict[str, Any]:
+    """Receipt fields that exist ONLY for the four newly assessable structures."""
+    fields: dict[str, Any] = {"structure_type": structure.value, "price_kind": price_kind(structure)}
+    summary = _structure_summary(trade, structure, contracts)
+    if summary is not None:
+        fields["max_loss"] = str(summary.max_loss)
+        fields["max_profit"] = None if summary.max_profit is None else str(summary.max_profit)
+        fields["break_evens"] = [str(value) for value in summary.break_evens]
+        fields["position_greeks"] = {
+            "unit": "per position: greek x quantity x multiplier, plus declared shares for delta",
+            **{name: str(getattr(summary.greeks, name)) for name in ("delta", "gamma", "theta", "vega")},
+        }
+    else:
+        fields.update(max_loss=UNAVAILABLE, max_profit=UNAVAILABLE, break_evens=UNAVAILABLE)
+    if structure in CREDIT_STRUCTURES:
+        low, high = _effective_credit_dte_window(policy)
+        fields["effective_dte_window"] = f"{low}..{high}"
+        fields["iv_edge"] = "unavailable"
+        fields["assignment_note"] = (
+            "The short leg is American-style: it can be assigned before expiry. "
+            "Assignment handling is the caller's responsibility."
+        )
+    elif any(leg.side == "sell" for leg in trade.legs):
+        fields["assignment_note"] = (
+            "The short put is American-style: it can be assigned before expiry. "
+            "Assignment handling is the caller's responsibility."
+        )
+    return fields
+
+
+def _evaluate_protective(
+    trade: TradeRequest,
+    policy: AssessmentPolicy,
+    evidence: Any,
+    now: datetime,
+    structure: StructureType,
+    contracts: dict[str, Any],
+    times: list[datetime],
+) -> dict[str, Any]:
+    """Protective put / put spread against caller-declared shares.
+
+    A separate path: it never resolves a catalyst direction, never runs the catalyst strategy and
+    never applies the direct-signal, minimum-score or direction checks (or their early returns).
+    """
+    stock = trade.stock_context
+    assert stock is not None  # protective structures are only classified with a stock context
+    as_of = min(times).isoformat()
+    quote_times = {symbol: c.quote.quoted_at.isoformat() for symbol, c in contracts.items()}
+    fields = {
+        "signal_score": None,
+        "score_profile": PROTECTIVE_PROFILE,
+        "score_components": None,
+        "minimum_passing_score": None,
+        "evidence_as_of": as_of,
+    }
+
+    def early(code: str) -> dict[str, Any]:
+        result = unavailable(trade, policy, code, evidence)
+        result["market_data"]["source_quote_times"] = quote_times
+        result.update(fields)
+        return result
+
+    if policy.execution_min_open_interest is not None and any(
+        c.quote.open_interest is None for c in contracts.values()
+    ):
+        return early("open_interest_missing")
+    if any(c.quote.greeks is None for c in contracts.values()):
+        return early("option_greeks_missing")
+    source = evidence.greeks_source
+    if (evidence.greeks_at is None) != (not source) or (
+        source is not None and (not isinstance(source, str) or not source.strip())
+    ):
+        return early("greek_provenance_contradictory")
+    if any(min(c.quote.bid_size, c.quote.ask_size) <= 0 for c in contracts.values()):
+        result = unavailable(trade, policy, evidence=evidence)
+        result.update(
+            fields,
+            decision="FAIL",
+            retryable=False,
+            blocking_reasons=["quote_depth"],
+            checks=[
+                {
+                    "code": "quote_depth",
+                    "passed": False,
+                    "actual": "0",
+                    "threshold": str(policy.minimum_quote_size),
+                    "message": "Choose genuine positive bid/ask depth meeting the minimum size.",
+                }
+            ],
+            remediation=["Choose genuine positive bid/ask depth meeting the minimum size."],
+        )
+        return result
+    expires = min(times) + timedelta(seconds=policy.execution_max_quote_age_seconds)
+    greeks = {name: Decimal(0) for name in ("delta", "gamma", "theta", "vega")}
+    short_bid = next(
+        (contracts[item.symbol].quote.bid for item in trade.legs if item.side == "sell"), Decimal(0)
+    )
+    legs = []
+    for leg in trade.legs:
+        q = contracts[leg.symbol].quote
+        legs.append(
+            AssessmentLeg(
+                symbol=leg.symbol,
+                side=leg.side,
+                quantity=trade.quantity,
+                price=trade.limit_price + short_bid if leg.side == "buy" else short_bid,
+                bid=q.bid,
+                ask=q.ask,
+                quote_size=min(q.bid_size, q.ask_size),
+                quoted_at=q.quoted_at,
+                open_interest=q.open_interest,
+                **{n: getattr(q.greeks, n) for n in greeks},
+            )
+        )
+        for name in greeks:
+            greeks[name] += getattr(q.greeks, name) * trade.quantity * (1 if leg.side == "buy" else -1)
+    legs.sort(key=lambda leg: leg.side != "buy")
+    underlying = next(iter(contracts.values())).underlying_symbol
+    summary = _structure_summary(trade, structure, contracts) if stock.shares == trade.quantity * 100 else None
+    request = StrategyAssessmentRequest(
+        underlying_symbol=underlying,
+        strategy_type=structure.value.upper(),
+        side="buy",
+        quantity=trade.quantity,
+        limit_price=trade.limit_price,
+        legs=tuple(legs),
+        max_loss=summary.max_loss if summary is not None else trade.limit_price * trade.quantity * 100,
+        greeks=greeks,
+        market_evidence_at=min(times),
+        observed_at=now,
+        expires_at=expires,
+    )
+    strategy_result = assess_strategy(
+        request,
+        policy,
+        paper_equity=None,
+        broker_evidence_available=True,
+        now=now,
+        standalone=True,
+        signal_evaluation=False,
+    )
+    checks = _convert_checks(strategy_result)
+
+    def check(code: str, passed: bool, actual: Any, threshold: Any, remediation: str) -> None:
+        checks.append(
+            {
+                "code": code,
+                "passed": bool(passed),
+                "actual": str(actual),
+                "threshold": str(threshold),
+                "message": remediation,
+            }
+        )
+
+    _add_leg_checks(check, trade, contracts, policy, evidence.spot, now)
+    long_put = contracts[next(leg.symbol for leg in trade.legs if leg.side == "buy")]
+    check(
+        "stock_symbol_matches",
+        stock.symbol == underlying,
+        stock.symbol,
+        underlying,
+        "The declared shares must be shares of the option's underlying.",
+    )
+    check(
+        "shares_match_contracts",
+        stock.shares == trade.quantity * 100,
+        stock.shares,
+        trade.quantity * 100,
+        "Declared shares must equal contracts x 100 (the put must cover the declared shares).",
+    )
+    check(
+        "put_floor_below_spot",
+        long_put.strike <= evidence.spot,
+        long_put.strike,
+        f"<= {evidence.spot}",
+        "The protective put strike must be at or below the current price.",
+    )
+    if len(trade.legs) == 2:
+        short_put = contracts[next(leg.symbol for leg in trade.legs if leg.side == "sell")]
+        check(
+            "short_put_below_long_put",
+            short_put.strike < long_put.strike,
+            short_put.strike,
+            f"< {long_put.strike}",
+            "The short put strike must be below the long put strike.",
+        )
+        width = long_put.strike - short_put.strike
+        check(
+            "debit_below_width",
+            trade.limit_price < width,
+            trade.limit_price,
+            width,
+            "The proposed net debit must be less than the spread width.",
+        )
+    cost_pct = trade.limit_price * 100 / evidence.spot
+    check(
+        "protective_cost_maximum",
+        cost_pct <= policy.protective_max_premium_pct,
+        cost_pct,
+        policy.protective_max_premium_pct,
+        "The net premium is too large relative to the declared stock value; choose a cheaper put.",
+    )
+    failed = [c for c in checks if not c["passed"]]
+    decision = (
+        strategy_result.decision
+        if strategy_result.decision == "UNAVAILABLE"
+        else ("FAIL" if failed else "PASS")
+    )
+    receipt = {
+        **unavailable(trade, policy),
+        **fields,
+        "decision": decision,
+        "checks": checks,
+        "blocking_reasons": [c["code"] for c in failed],
+        "remediation": [
+            f"{c['code']}: actual={c['actual']}; required={c['threshold']}. {c['message']}"
+            for c in failed
+        ],
+        "retryable": decision == "UNAVAILABLE",
+        "observed_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+        "evidence_observed_at": as_of,
+        "market_data": {
+            "source": "alpaca",
+            "feed": getattr(evidence, "market_data_feed", "indicative"),
+            "requested_feed": "indicative",
+            "quality": getattr(evidence, "market_data_quality", "testing_only"),
+            "greeks_calculation_provenance": evidence.greeks_source,
+            "greeks_calculated_at": evidence.greeks_at.isoformat() if evidence.greeks_at else None,
+            "greeks_calculation_freshness": "verified" if evidence.greeks_at else "unknown",
+            "warnings": [] if evidence.greeks_at else ["greek_calculation_time_unknown"],
+            "source_quote_times": quote_times,
+        },
+        "scope": "TRADE_ASSESSMENT",
+        "trade": trade_wire(trade),
+        "account_checks": "Delegated to caller: identity, buying power, portfolio/exposure limits, "
+        "fees, reconciliation and execution authorization. The declared shares are caller-declared "
+        "and not verified against any broker account. Whether a hedge is appropriate is delegated "
+        "to the caller.",
+        "hedge_appropriateness": "delegated_to_caller",
+    }
+    receipt["option_quotes"] = [
+        {
+            "symbol": leg.symbol,
+            "side": leg.side,
+            "bid": str(leg.bid),
+            "ask": str(leg.ask),
+            "bid_size": str(contracts[leg.symbol].quote.bid_size),
+            "ask_size": str(contracts[leg.symbol].quote.ask_size),
+            "quoted_at": leg.quoted_at.isoformat(),
+            "spread_ratio": (
+                str((leg.ask - leg.bid) / ((leg.ask + leg.bid) / Decimal("2")))
+                if leg.bid + leg.ask
+                else UNAVAILABLE
+            ),
+        }
+        for leg in legs
+    ]
+    receipt["option_economics"] = protective_economics(
+        legs=list(trade.legs),
+        contracts=contracts,
+        premium=trade.limit_price,
+        shares=stock.shares,
+        stock_entry=stock.entry_price,
+        spot=evidence.spot,
+        today=now.date(),
+    )
+    receipt.update(_new_structure_fields(trade, structure, contracts, policy, now))
+    provenance = getattr(evidence, "provenance", None)
+    if provenance is not None:
+        receipt["evidence_provenance"] = provenance
+    return receipt
 
 
 def evaluate(
     trade: TradeRequest, policy: AssessmentPolicy, evidence: Any, now: datetime | None = None
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
-    if not supported_shape(trade):
+    structure = gate_structure(trade, policy)
+    if structure is None:
         result = unavailable(trade, policy, "unsupported_strategy", evidence)
         result["retryable"] = False
         result["remediation"] = [
@@ -452,7 +947,10 @@ def evaluate(
         return unavailable(trade, policy, "stale_or_invalid_evidence", evidence)
     if evidence.spot <= 0:
         return unavailable(trade, policy, "underlying_price_missing", evidence)
-    proposed = proposed_direction(trade)
+    if structure in PROTECTIVE_STRUCTURES:
+        return _evaluate_protective(trade, policy, evidence, now, structure, contracts, times)
+    proposed = structure_direction(structure)
+    assert proposed is not None  # only the protective structures have no direction
     resolved = resolve_direction(evidence.features, proposed)
     if policy.execution_min_open_interest is not None and any(
         c.quote.open_interest is None for c in contracts.values()
@@ -518,6 +1016,12 @@ def evaluate(
     short_price = next(
         (contracts[item.symbol].quote.bid for item in trade.legs if item.side == "sell"), Decimal(0)
     )
+    credit_shape = structure in CREDIT_STRUCTURES
+    # Credit mirror of the debit construction: the long leg is bought at its ask and the short leg
+    # is sold for that ask plus the net credit, so (sell price - buy price) equals the credit.
+    long_ask = next(
+        (contracts[item.symbol].quote.ask for item in trade.legs if item.side == "buy"), Decimal(0)
+    )
     for leg in trade.legs:
         c = contracts[leg.symbol]
         q = c.quote
@@ -527,7 +1031,11 @@ def evaluate(
                 symbol=leg.symbol,
                 side=leg.side,
                 quantity=trade.quantity,
-                price=trade.limit_price + short_price if leg.side == "buy" else short_price,
+                price=(
+                    (trade.limit_price + long_ask if leg.side == "sell" else long_ask)
+                    if credit_shape
+                    else (trade.limit_price + short_price if leg.side == "buy" else short_price)
+                ),
                 bid=q.bid,
                 ask=q.ask,
                 quote_size=min(q.bid_size, q.ask_size),
@@ -541,16 +1049,27 @@ def evaluate(
                 greeks[name] += getattr(g, name) * trade.quantity * (1 if leg.side == "buy" else -1)
     legs.sort(key=lambda leg: leg.side != "buy")
     underlying = next(iter(contracts.values())).underlying_symbol
+    credit_width = abs(
+        contracts[trade.legs[0].symbol].strike - contracts[trade.legs[-1].symbol].strike
+    )
     request = StrategyAssessmentRequest(
         underlying_symbol=underlying,
-        strategy_type="SINGLE_LEG_OPTION"
-        if len(legs) == 1
-        else _spread_strategy_type(legs[0].symbol),
-        side="buy",
+        strategy_type=(
+            structure.value.upper()
+            if credit_shape
+            else "SINGLE_LEG_OPTION"
+            if len(legs) == 1
+            else _spread_strategy_type(legs[0].symbol)
+        ),
+        side="sell" if credit_shape else "buy",
         quantity=trade.quantity,
         limit_price=trade.limit_price,
         legs=tuple(legs),
-        max_loss=trade.limit_price * trade.quantity * 100,
+        max_loss=(
+            max(Decimal(0), (credit_width - trade.limit_price) * trade.quantity * 100)
+            if credit_shape
+            else trade.limit_price * trade.quantity * 100
+        ),
         greeks=greeks,
         market_evidence_at=min(times),
         observed_at=now,
@@ -586,30 +1105,9 @@ def evaluate(
         trusted_signal_direction=direction,
         standalone=True,
         resolved_direction=resolved,
+        structure_direction=proposed.value,
     )
-    checks = []
-    for original in strategy_result.checks:
-        c = original.model_dump(mode="json")
-        message = c["reason"]
-        if not c["passed"] and c["code"] == "policy_loss":
-            message = (
-                "Reduce the proposed debit or quantity until maximum planned loss is "
-                "within the workspace limit."
-            )
-        elif not c["passed"] and c["code"] == "minimum_signal_score":
-            message = (
-                "The trusted market signal does not meet the workspace minimum score; "
-                "wait for stronger verified evidence."
-            )
-        checks.append(
-            {
-                "code": c["code"],
-                "passed": c["passed"],
-                "actual": c["actual"],
-                "threshold": c["limit"],
-                "message": message,
-            }
-        )
+    checks = _convert_checks(strategy_result)
 
     def check(code: str, passed: bool, actual: Any, threshold: Any, remediation: str) -> None:
         checks.append(
@@ -666,32 +1164,10 @@ def evaluate(
             "Operator policy did not require price-action confirmation; evidence is not classified "
             "as confirmed.",
         )
-    for leg in trade.legs:
-        c = contracts[leg.symbol]
-        dte = (c.expiration - now.date()).days
-        check(
-            f"{leg.symbol}_tradable",
-            c.tradable,
-            c.tradable,
-            True,
-            "Choose a currently tradable standard contract.",
-        )
-        check(
-            f"{leg.symbol}_dte",
-            policy.minimum_dte <= dte <= policy.maximum_dte,
-            dte,
-            f"{policy.minimum_dte}..{policy.maximum_dte}",
-            "Choose an expiry within the permitted DTE range.",
-        )
-        distance = abs(c.strike - evidence.spot) / evidence.spot
-        check(
-            f"{leg.symbol}_strike_distance",
-            distance <= policy.maximum_strike_distance_ratio,
-            distance,
-            policy.maximum_strike_distance_ratio,
-            "Choose a strike within the permitted distance from the underlying.",
-        )
-    if len(legs) == 2:
+    _add_leg_checks(check, trade, contracts, policy, evidence.spot, now)
+    if credit_shape:
+        _add_credit_checks(check, trade, structure, contracts, policy, evidence.spot, now)
+    elif len(legs) == 2:
         width = abs(contracts[legs[0].symbol].strike - contracts[legs[1].symbol].strike)
         check(
             "debit_below_width",
@@ -738,7 +1214,7 @@ def evaluate(
             },
         },
         "scope": "TRADE_ASSESSMENT",
-        "trade": trade.model_dump(mode="json"),
+        "trade": trade_wire(trade),
         "account_checks": "Delegated to caller: identity, buying power, portfolio/exposure limits, "
         "fees, reconciliation and execution authorization.",
     }
@@ -767,14 +1243,23 @@ def evaluate(
         }
         for leg in legs
     ]
-    receipt["option_economics"] = option_economics(
-        legs=list(trade.legs),
-        contracts=contracts,
-        spot=evidence.spot,
-        premium=trade.limit_price,
-        today=now.date(),
-        average_range_pct=getattr(evidence, "average_range_pct", None),
-    )
+    if credit_shape:
+        receipt["option_economics"] = credit_economics(
+            legs=list(trade.legs),
+            contracts=contracts,
+            credit=trade.limit_price,
+            today=now.date(),
+        )
+        receipt.update(_new_structure_fields(trade, structure, contracts, policy, now))
+    else:
+        receipt["option_economics"] = option_economics(
+            legs=list(trade.legs),
+            contracts=contracts,
+            spot=evidence.spot,
+            premium=trade.limit_price,
+            today=now.date(),
+            average_range_pct=getattr(evidence, "average_range_pct", None),
+        )
     provenance = getattr(evidence, "provenance", None)
     if provenance is not None:
         receipt["evidence_provenance"] = provenance

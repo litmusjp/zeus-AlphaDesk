@@ -22,9 +22,9 @@ from packages.connected.trade_assessment import (
     TradeRequest,
     evaluate,
     policy_metadata,
-    supported_shape,
     unavailable,
 )
+from packages.connected.trade_structure import gate_structure
 from packages.database.models import ManagedReviewGateRecord, WorkspaceRecord
 from packages.security.agent_keys import hash_agent_key
 from packages.security.store import CredentialStore
@@ -351,7 +351,9 @@ async def assess_option_trade(
         value["policy_version"] += f":quality:{quality_revision}"
         return value
 
-    if not supported_shape(trade):
+    # One gate, shared with the evaluator, BEFORE any provider access: a shape that is unknown or
+    # not enabled for this workspace never loads evidence (today's unsupported_strategy receipt).
+    if gate_structure(trade, policy) is None:
         result = evaluate(trade, policy, None)
         return await finalize(result)
     factory = getattr(request.app.state, "trade_assessment_provider_factory", None)

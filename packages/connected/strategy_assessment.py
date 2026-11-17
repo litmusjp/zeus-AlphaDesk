@@ -130,9 +130,55 @@ def _check(code: str, passed: bool, actual: Any, limit: Any, reason: str) -> Ass
 _OCC_SYMBOL = re.compile(r"^(?P<root>[A-Z0-9]{1,6})(?P<date>\d{6})(?P<type>[CP])(?P<strike>\d{8})$")
 
 
+_CREDIT_TYPES = frozenset({"BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"})
+_PROTECTIVE_TYPES = frozenset({"PROTECTIVE_PUT", "PROTECTIVE_PUT_SPREAD"})
+
+
+def _new_structure_shape_check(request: StrategyAssessmentRequest) -> tuple[bool, str]:
+    """Standalone shape check for the credit and protective structures (Phase B)."""
+    strategy_type = request.strategy_type.upper()
+    parsed: list[tuple[str, str, int]] = []
+    for leg in request.legs:
+        match = _OCC_SYMBOL.fullmatch(leg.symbol.upper())
+        if match is None:
+            return False, "Every option leg must use an unambiguous OCC identity."
+        if match.group("root") != request.underlying_symbol.upper():
+            return False, "Every option leg must match the requested underlying."
+        parsed.append((match.group("date"), match.group("type"), int(match.group("strike"))))
+    expected_legs = 1 if strategy_type == "PROTECTIVE_PUT" else 2
+    if len(parsed) != expected_legs:
+        return False, "The leg count does not match the structure."
+    if strategy_type == "PROTECTIVE_PUT":
+        ok = request.side == "buy" and request.legs[0].side == "buy" and parsed[0][1] == "P"
+        return ok, "A protective put is one long put against declared shares."
+    if parsed[0][0] != parsed[1][0] or parsed[0][1] != parsed[1][1]:
+        return False, "A vertical requires matching expiry and option type."
+    if {request.legs[0].side, request.legs[1].side} != {"buy", "sell"}:
+        return False, "A vertical requires one long and one short leg."
+    long_index = 0 if request.legs[0].side == "buy" else 1
+    long_strike, short_strike = parsed[long_index][2], parsed[1 - long_index][2]
+    kind = parsed[0][1]
+    if strategy_type == "BULL_PUT_CREDIT_SPREAD":
+        return (
+            request.side == "sell" and kind == "P" and short_strike > long_strike,
+            "A bull put credit spread sells the higher put strike and buys the lower.",
+        )
+    if strategy_type == "BEAR_CALL_CREDIT_SPREAD":
+        return (
+            request.side == "sell" and kind == "C" and short_strike < long_strike,
+            "A bear call credit spread sells the lower call strike and buys the higher.",
+        )
+    return (
+        request.side == "buy" and kind == "P" and long_strike > short_strike,
+        "A protective put spread buys the higher put strike and sells the lower, against shares.",
+    )
+
+
 def _option_shape_check(
     request: StrategyAssessmentRequest, *, standalone: bool = False
 ) -> tuple[bool, str]:
+    if standalone and request.strategy_type.upper() in (_CREDIT_TYPES | _PROTECTIVE_TYPES):
+        return _new_structure_shape_check(request)
     if request.scope != "SIGNAL_QUALITY" and not standalone:
         return (
             len(request.legs) in (2, 4),
@@ -200,6 +246,8 @@ def assess_strategy(
     trusted_signal_direction: str | None = None,
     standalone: bool = False,
     resolved_direction: Direction | None = None,
+    structure_direction: str | None = None,
+    signal_evaluation: bool = True,
 ) -> StrategyAssessmentResult:
     current = now or datetime.now(UTC)
     age = Decimal(str((current - request.market_evidence_at).total_seconds()))
@@ -210,7 +258,9 @@ def assess_strategy(
             "strategy_shape",
             shape_passed,
             len(request.legs),
-            "single long option or two-leg debit vertical",
+            "single long option or two-leg debit vertical"
+            if request.strategy_type.upper() not in (_CREDIT_TYPES | _PROTECTIVE_TYPES)
+            else request.strategy_type.lower(),
             shape_reason,
         )
     )
@@ -409,7 +459,7 @@ def assess_strategy(
         score_signal(score_features, resolved_direction) if score_features is not None else None
     )
     market_scanner_signal_score = calculated_signal_score
-    if request.is_external or standalone:
+    if (request.is_external or standalone) and signal_evaluation:
         score_ready = (
             calculated_signal_score is not None
             and score_source
@@ -447,8 +497,10 @@ def assess_strategy(
             score_source = None
             score_observed_at = None
         if signal_quality and trusted_signal_direction is not None:
+            # The structure-derived direction (credit puts are bullish, credit calls bearish) is
+            # authoritative; the first-leg call/put rule remains only where none is supplied.
             option_match = _OCC_SYMBOL.fullmatch(request.legs[0].symbol.upper())
-            option_direction = (
+            option_direction = structure_direction or (
                 "BULLISH"
                 if option_match is not None and option_match.group("type") == "C"
                 else "BEARISH"

@@ -133,3 +133,115 @@ def option_economics(
         block["days_to_expiry"] = UNAVAILABLE
     block["range_proxy"] = _guard(proxy)
     return block
+
+
+CREDIT_COST_BASIS = (
+    "Half of the bid-ask width summed over both legs divided by the net credit: the cost of one "
+    "crossing, as a percent of the credit received."
+)
+
+
+def _net_theta(legs: list[Any], contracts: dict[str, Any]) -> Decimal:
+    net = Decimal(0)
+    for leg in legs:
+        greeks = contracts[leg.symbol].quote.greeks
+        if greeks is None or greeks.theta is None:
+            raise ArithmeticError("theta missing")
+        net += greeks.theta if leg.side == "buy" else -greeks.theta
+    return net
+
+
+def credit_economics(
+    *, legs: list[Any], contracts: dict[str, Any], credit: Decimal, today: date
+) -> dict[str, Any]:
+    """Information-only block for a bull put or bear call credit vertical (all per share).
+
+    A credit spread can profit with no favourable move, so there is no "required move" and no
+    range proxy; those fields are reported as not applicable rather than invented.
+    """
+    block: dict[str, Any] = {
+        "information_only": True,
+        "structure": "credit_vertical",
+        "spread_cost_basis": CREDIT_COST_BASIS,
+        "required_move_pct": "not_applicable",
+        "range_proxy": "not_applicable",
+        "credit": _guard(lambda: credit),
+    }
+    try:
+        short = next(leg for leg in legs if leg.side == "sell")
+        long = next(leg for leg in legs if leg.side == "buy")
+        short_contract, long_contract = contracts[short.symbol], contracts[long.symbol]
+        is_call = short_contract.option_type == "call"
+        selected = [short_contract, long_contract]
+    except (StopIteration, KeyError, AttributeError, TypeError):
+        for name in ("width", "max_profit", "max_loss", "expiry_break_even", "spread_cost_pct",
+                     "net_theta_per_day_per_share", "days_to_expiry"):
+            block[name] = UNAVAILABLE
+        return block
+    width = abs(short_contract.strike - long_contract.strike)
+    block["width"] = _guard(lambda: width)
+    block["max_profit"] = _guard(lambda: credit)
+    block["max_loss"] = _guard(lambda: width - credit)
+    block["expiry_break_even"] = _guard(
+        lambda: short_contract.strike + credit if is_call else short_contract.strike - credit
+    )
+
+    def cost() -> Decimal:
+        if credit <= 0 or any(c.quote.ask < c.quote.bid for c in selected):
+            raise ArithmeticError("credit must be positive and quotes uncrossed")
+        return sum(((c.quote.ask - c.quote.bid) / 2 for c in selected), Decimal(0)) / credit * 100
+
+    block["spread_cost_pct"] = _guard(cost)
+    block["net_theta_per_day_per_share"] = _guard(lambda: _net_theta(legs, contracts))
+    try:
+        block["days_to_expiry"] = (min(c.expiration for c in selected) - today).days
+    except (TypeError, ValueError, AttributeError):
+        block["days_to_expiry"] = UNAVAILABLE
+    return block
+
+
+def protective_economics(
+    *,
+    legs: list[Any],
+    contracts: dict[str, Any],
+    premium: Decimal,
+    shares: int,
+    stock_entry: Decimal,
+    spot: Decimal,
+    today: date,
+) -> dict[str, Any]:
+    """Information-only block for a protective put / put spread against declared shares."""
+    spread = len(legs) == 2
+    block: dict[str, Any] = {
+        "information_only": True,
+        "structure": "protective_put_spread" if spread else "protective_put",
+        "stock_context_basis": "declared by the caller; not verified against any broker account",
+        "premium": _guard(lambda: premium),
+    }
+    try:
+        long = next(leg for leg in legs if leg.side == "buy")
+        long_contract = contracts[long.symbol]
+        short = next((leg for leg in legs if leg.side == "sell"), None)
+        selected = [contracts[leg.symbol] for leg in legs]
+    except (StopIteration, KeyError, AttributeError, TypeError):
+        for name in ("floor_strike", "cost_pct_of_stock_value", "expiry_break_even",
+                     "net_theta_per_day_per_share", "days_to_expiry"):
+            block[name] = UNAVAILABLE
+        return block
+    block["floor_strike"] = _guard(lambda: long_contract.strike)
+    if short is not None:
+        short_contract = contracts[short.symbol]
+        block["short_put_strike"] = _guard(lambda: short_contract.strike)
+        block["residual_risk_note"] = (
+            "Below the short put strike the long put is offset by the short put, so downside "
+            "is not floored there."
+        )
+    block["cost_pct_of_stock_value"] = _guard(lambda: premium * 100 / spot if spot > 0 else 1 / 0)
+    block["expiry_break_even"] = _guard(lambda: stock_entry + premium)
+    block["net_theta_per_day_per_share"] = _guard(lambda: _net_theta(legs, contracts))
+    block["declared_shares"] = shares
+    try:
+        block["days_to_expiry"] = (min(c.expiration for c in selected) - today).days
+    except (TypeError, ValueError, AttributeError):
+        block["days_to_expiry"] = UNAVAILABLE
+    return block

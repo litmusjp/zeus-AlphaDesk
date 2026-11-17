@@ -84,7 +84,11 @@ async def call_trade_assessment_api(trade: dict[str, Any]) -> dict[str, Any]:
 
     import httpx
 
-    from packages.connected.trade_assessment import TradeRequest, validate_pass_receipt
+    from packages.connected.trade_assessment import (
+        TradeRequest,
+        trade_wire,
+        validate_pass_receipt,
+    )
 
     proposal = TradeRequest.model_validate(trade)
     base = os.environ.get("ALPHADESK_API_URL", "").rstrip("/")
@@ -106,7 +110,7 @@ async def call_trade_assessment_api(trade: dict[str, Any]) -> dict[str, Any]:
             response = await client.post(
                 f"{base}/api/v2/option-trade-assessments",
                 headers={"X-AlphaDesk-API-Key": key},
-                json=proposal.model_dump(mode="json"),
+                json=trade_wire(proposal),
             )
             response.raise_for_status()
             if len(response.content) > 262144:
