@@ -18,6 +18,7 @@ from apps.api.routes.agent import AgentKeyContext, require_agent_key
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.configuration.settings import Settings
 from packages.connected.assessment_policy import AssessmentPolicy
+from packages.connected.direct_evidence import EvidenceUnavailable
 from packages.database.models import ManagedReviewGateRecord, WorkspaceRecord
 from tests.unit.test_all8_assessment import (
     BEAR_CALL,
@@ -229,3 +230,50 @@ def test_a_stored_policy_without_the_new_keys_behaves_as_today():
     client, provider, _ = make_client(stored={"minimum_dte": 14})
     assert post(client, BULL_PUT).json()["blocking_reasons"] == ["unsupported_strategy"]
     assert provider.calls == 0
+
+
+class FailingProvider:
+    def __init__(self, error):
+        self.error, self.calls = error, 0
+
+    async def get_evidence(self, trade):
+        self.calls += 1
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [
+        (EvidenceUnavailable("market_data_permission_denied"), "market_data_permission_denied"),
+        (TimeoutError(), "assessment_deadline_exceeded"),
+        (ValueError("bad evidence"), "invalid_market_evidence"),
+    ],
+    ids=["provider-unavailable", "timeout", "invalid-evidence"],
+)
+@pytest.mark.parametrize(
+    "legs,limit", [(PROT_PUT, "3.05"), (PROT_SPREAD, "2.00")], ids=["put", "put-spread"]
+)
+def test_enabled_protective_provider_failures_keep_the_protective_contract(
+    error, reason, legs, limit
+):
+    client, _, _ = make_client(stored={"allowed_structures": ALL_EIGHT})
+    failing = FailingProvider(error)
+    client.app.state.trade_assessment_provider_factory = lambda key: failing
+    response = post(client, legs, limit, STOCK)
+    assert response.status_code == 200
+    result = response.json()
+    assert failing.calls == 1
+    assert result["decision"] == "UNAVAILABLE" and result["blocking_reasons"] == [reason]
+    assert result["score_profile"] == "protective_structure_v1"
+    assert result["signal_score"] is None and result["minimum_passing_score"] is None
+    assert result["hedge_appropriateness"] == "delegated_to_caller"
+
+
+def test_provider_failure_on_an_existing_shape_is_unchanged():
+    client, _, _ = make_client()
+    client.app.state.trade_assessment_provider_factory = lambda key: FailingProvider(
+        EvidenceUnavailable("market_data_permission_denied")
+    )
+    result = post(client, [(C200.symbol, "buy"), (C205.symbol, "sell")], "1.10").json()
+    assert result["score_profile"] == "catalyst_momentum_v2"
+    assert "hedge_appropriateness" not in result and "stock_context_basis" not in result

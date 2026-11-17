@@ -382,6 +382,21 @@ def validate_pass_receipt(
     return True
 
 
+def _protective_metadata() -> dict[str, Any]:
+    """Receipt metadata of every enabled protective assessment, healthy or not.
+
+    No catalyst score, the protective profile and the disclosures: absent evidence must not turn
+    into catalyst authority."""
+    return {
+        "signal_score": None,
+        "score_profile": PROTECTIVE_PROFILE,
+        "score_components": None,
+        "minimum_passing_score": None,
+        "hedge_appropriateness": "delegated_to_caller",
+        "stock_context_basis": "declared by the caller; not verified against any broker account",
+    }
+
+
 def unavailable(
     trade: TradeRequest,
     policy: AssessmentPolicy,
@@ -413,7 +428,7 @@ def unavailable(
         ):
             greek_freshness = "verified"
             greek_warnings = []
-    return {
+    result = {
         **policy_metadata(policy),
         "assessment_id": str(uuid4()),
         "decision": "UNAVAILABLE",
@@ -442,6 +457,11 @@ def unavailable(
         "observed_at": datetime.now(UTC).isoformat(),
         "expires_at": None,
     }
+    # Only an ENABLED protective request gets the protective contract; disabled or unknown shapes
+    # and every existing shape keep today's bytes.
+    if gate_structure(trade, policy) in PROTECTIVE_STRUCTURES:
+        result.update(_protective_metadata())
+    return result
 
 
 _OCC = re.compile(r"^([A-Z0-9]{1,6})(\d{6})([CP])(\d{8})$")
@@ -689,13 +709,7 @@ def _evaluate_protective(
     assert stock is not None  # protective structures are only classified with a stock context
     as_of = min(times).isoformat()
     quote_times = {symbol: c.quote.quoted_at.isoformat() for symbol, c in contracts.items()}
-    fields = {
-        "signal_score": None,
-        "score_profile": PROTECTIVE_PROFILE,
-        "score_components": None,
-        "minimum_passing_score": None,
-        "evidence_as_of": as_of,
-    }
+    fields = {**_protective_metadata(), "evidence_as_of": as_of}
 
     def early(code: str) -> dict[str, Any]:
         result = unavailable(trade, policy, code, evidence)
@@ -715,23 +729,9 @@ def _evaluate_protective(
     ):
         return early("greek_provenance_contradictory")
     if any(min(c.quote.bid_size, c.quote.ask_size) <= 0 for c in contracts.values()):
-        result = unavailable(trade, policy, evidence=evidence)
-        result.update(
-            fields,
-            decision="FAIL",
-            retryable=False,
-            blocking_reasons=["quote_depth"],
-            checks=[
-                {
-                    "code": "quote_depth",
-                    "passed": False,
-                    "actual": "0",
-                    "threshold": str(policy.minimum_quote_size),
-                    "message": "Choose genuine positive bid/ask depth meeting the minimum size.",
-                }
-            ],
-            remediation=["Choose genuine positive bid/ask depth meeting the minimum size."],
-        )
+        # Absent executable depth is missing evidence, not a failed structure: UNAVAILABLE.
+        result = early("quote_depth")
+        result["remediation"] = ["Choose genuine positive bid/ask depth meeting the minimum size."]
         return result
     expires = min(times) + timedelta(seconds=policy.execution_max_quote_age_seconds)
     greeks = {name: Decimal(0) for name in ("delta", "gamma", "theta", "vega")}

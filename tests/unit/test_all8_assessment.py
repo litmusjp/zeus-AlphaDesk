@@ -4,6 +4,7 @@ Layers: L1 engine maths at several quantities, L2 shape matrix and gate, L3 per-
 (direction, each credit/protective check, evidence failures), plus policy and wire-compat guards.
 """
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -515,52 +516,126 @@ def test_protective_checks_fail_individually():
     assert check_of(wide, "debit_below_width")["passed"] is False
 
 
+def with_quote(c, **changes):
+    return c.model_copy(update={"quote": c.quote.model_copy(update=changes)})
+
+
+PROTECTIVE_FORMS = [
+    ("protective put", PROT_PUT, (HEDGE_PUT,), "3.05"),
+    ("protective put spread", PROT_SPREAD, PROT_SPREAD_CONTRACTS, "2.00"),
+]
+# (name, build contracts from the healthy ones, evidence kwargs, expected reason)
+EARLY_FAILURES = [
+    (
+        "stale quote",
+        lambda cs: (with_quote(cs[0], quoted_at=datetime(2026, 10, 6, 14, 0, tzinfo=UTC)), *cs[1:]),
+        {},
+        "stale_or_invalid_evidence",
+    ),
+    (
+        "future quote",
+        lambda cs: (with_quote(cs[0], quoted_at=datetime(2026, 10, 6, 16, 0, tzinfo=UTC)), *cs[1:]),
+        {},
+        "stale_or_invalid_evidence",
+    ),
+    (
+        "missing contract evidence",
+        lambda cs: cs[:1] if len(cs) > 1 else (P185,),
+        {},
+        "contract_evidence_missing",
+    ),
+    (
+        "contract identity mismatch",
+        lambda cs: (cs[0].model_copy(update={"strike": Decimal(196)}), *cs[1:]),
+        {},
+        "contract_identity_mismatch",
+    ),
+    ("missing spot", lambda cs: cs, {"spot": "0"}, "underlying_price_missing"),
+    (
+        "missing greeks",
+        lambda cs: (
+            (with_quote(cs[-1], greeks=None), *cs[:-1])
+            if len(cs) > 1
+            else (with_quote(cs[0], greeks=None),)
+        ),
+        {},
+        "option_greeks_missing",
+    ),
+    (
+        "missing open interest",
+        lambda cs: (with_quote(cs[0], open_interest=None), *cs[1:]),
+        {},
+        "open_interest_missing",
+    ),
+    (
+        "zero bid depth on the first leg",
+        lambda cs: (with_quote(cs[0], bid_size=Decimal(0)), *cs[1:]),
+        {},
+        "quote_depth",
+    ),
+    (
+        "zero ask depth on the last leg",
+        lambda cs: (*cs[:-1], with_quote(cs[-1], ask_size=Decimal(0))),
+        {},
+        "quote_depth",
+    ),
+]
+
+
+def assert_protective_contract(result, reason):
+    assert result["decision"] == "UNAVAILABLE", result["blocking_reasons"]
+    assert result["blocking_reasons"] == [reason]
+    assert result["score_profile"] == PROTECTIVE_PROFILE
+    assert result["signal_score"] is None and result["score_components"] is None
+    assert result["minimum_passing_score"] is None
+    assert result["hedge_appropriateness"] == "delegated_to_caller"
+    assert "not verified" in result["stock_context_basis"]
+    assert "catalyst_confidence" not in result and "direction_basis" not in result
+
+
 @pytest.mark.parametrize(
-    "mutate,code,decision",
-    [
-        (
-            lambda c: c.model_copy(update={"quote": c.quote.model_copy(update={"greeks": None})}),
-            "option_greeks_missing",
-            "UNAVAILABLE",
-        ),
-        (
-            lambda c: c.model_copy(
-                update={"quote": c.quote.model_copy(update={"open_interest": None})}
-            ),
-            "open_interest_missing",
-            "UNAVAILABLE",
-        ),
-        (
-            lambda c: c.model_copy(
-                update={"quote": c.quote.model_copy(update={"bid_size": Decimal(0)})}
-            ),
-            "quote_depth",
-            "FAIL",
-        ),
-        (
-            lambda c: c.model_copy(
-                update={
-                    "quote": c.quote.model_copy(
-                        update={"quoted_at": datetime(2026, 10, 6, 14, 0, tzinfo=UTC)}
-                    )
-                }
-            ),
-            "stale_or_invalid_evidence",
-            "UNAVAILABLE",
-        ),
-    ],
+    "form,legs,contracts,limit", PROTECTIVE_FORMS, ids=[f[0] for f in PROTECTIVE_FORMS]
 )
-def test_protective_evidence_failures_keep_the_protective_profile(mutate, code, decision):
+@pytest.mark.parametrize(
+    "name,mutate,ev_kwargs,reason", EARLY_FAILURES, ids=[e[0] for e in EARLY_FAILURES]
+)
+def test_every_enabled_protective_evidence_failure_keeps_the_protective_contract(
+    form, legs, contracts, limit, name, mutate, ev_kwargs, reason
+):
+    if name == "missing contract evidence" and len(contracts) == 1:
+        broken = (P185,)  # evidence for a different contract than the one requested
+    else:
+        broken = tuple(mutate(contracts))
     result = evaluate(
-        request(PROT_PUT, limit="3.05", stock=STOCK),
-        policy(),
-        evidence((mutate(HEDGE_PUT),)),
-        now=NOW,
+        request(legs, limit=limit, stock=STOCK), policy(), evidence(broken, **ev_kwargs), now=NOW
     )
-    assert result["decision"] == decision
-    assert result["blocking_reasons"] == [code]
-    if code != "stale_or_invalid_evidence":
-        assert result["score_profile"] == PROTECTIVE_PROFILE and result["signal_score"] is None
+    assert_protective_contract(result, reason)
+    # Absent evidence is retryable; it never became a FAIL or a catalyst-scored receipt.
+    assert result["retryable"] is True
+
+
+def test_greek_provenance_contradiction_keeps_the_protective_contract():
+    ev = evidence((HEDGE_PUT,))
+    ev = replace(ev, greeks_at=None)  # a source without a time
+    result = evaluate(request(PROT_PUT, limit="3.05", stock=STOCK), policy(), ev, now=NOW)
+    assert_protective_contract(result, "greek_provenance_contradictory")
+
+
+def test_genuine_protective_quality_failures_are_still_fail_not_unavailable():
+    pricey = evaluate(
+        request(PROT_PUT, limit="12", stock=STOCK), policy(), evidence((HEDGE_PUT,)), now=NOW
+    )
+    assert pricey["decision"] == "FAIL" and pricey["score_profile"] == PROTECTIVE_PROFILE
+
+
+def test_disabled_protective_requests_keep_todays_exact_unsupported_receipt():
+    for legs, limit in ((PROT_PUT, "3.05"), (PROT_SPREAD, "2.00")):
+        result = evaluate(
+            request(legs, limit=limit, stock=STOCK), AssessmentPolicy(), None, now=NOW
+        )
+        assert result["score_profile"] == "catalyst_momentum_v2"
+        assert result["minimum_passing_score"] == "65"
+        assert "hedge_appropriateness" not in result and "stock_context_basis" not in result
 
 
 def test_stock_context_validation_and_the_v3_fingerprint_contract():
