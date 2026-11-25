@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from packages.domain.options import Greeks, OptionContract, OptionQuote
 from packages.domain.workflow import CatalystFeatures
+
+if TYPE_CHECKING:
+    from packages.connected.trade_assessment import TradeRequest
 
 _HISTORICAL_SESSION_COUNT = 24
 _HISTORICAL_LOOKBACK_DAYS = 60
@@ -64,13 +67,13 @@ def number(value: Any) -> Decimal:
 
 
 def _features_and_news_count(
-    stocks: dict,
-    bars: list[dict],
-    news: list[dict],
+    stocks: dict[str, Any],
+    bars: list[dict[str, Any]],
+    news: list[dict[str, Any]],
     underlying: str,
     liquidity: Decimal,
     *,
-    calendar: list[dict] | None = None,
+    calendar: list[dict[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> tuple[CatalystFeatures, Decimal, datetime, int]:
     """Existing catalyst feature transformations, but with real source timestamps and liquidity."""
@@ -86,7 +89,7 @@ def _features_and_news_count(
         raise EvidenceUnavailable("market_calendar_evidence_missing")
     previous_session = max(prior_sessions)
 
-    def session_date(value):
+    def session_date(value: Any) -> date:
         return timestamp(value).astimezone(market_zone).date()
 
     for symbol in {underlying, "SPY", "QQQ"}:
@@ -142,7 +145,7 @@ def _features_and_news_count(
     volumes = [number(b["v"]) for b in bars]
     if not volumes or min(price, previous, opened, volume, *volumes) <= 0:
         raise EvidenceUnavailable("historical_market_evidence_missing")
-    average = sum(volumes) / len(volumes)
+    average = sum(volumes, Decimal(0)) / len(volumes)
     if average <= 0:
         raise EvidenceUnavailable("historical_market_evidence_missing")
     positive = {
@@ -183,10 +186,10 @@ def _features_and_news_count(
         Decimal(1),
     )
 
-    def clamp(value):
+    def clamp(value: Decimal) -> Decimal:
         return min(max(value, Decimal(-1)), Decimal(1))
 
-    def confirmation(symbol):
+    def confirmation(symbol: str) -> Decimal:
         snapshot = stocks[symbol]
         prior = number(snapshot["dailyBar"]["o"])
         latest = number(snapshot["latestTrade"]["p"])
@@ -240,13 +243,15 @@ def average_range_percent(bars: list[dict[str, Any]]) -> Decimal | None:
 
 
 class DirectEvidenceProvider:
-    def __init__(self, key: str, secret: str, *, transport=None):
+    def __init__(
+        self, key: str, secret: str, *, transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
         self._headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
         self._transport = transport
         self._inflight: dict[tuple[str, ...], asyncio.Task[TradeEvidence]] = {}
         self._cache: OrderedDict[tuple[str, ...], tuple[float, TradeEvidence]] = OrderedDict()
 
-    async def get_evidence(self, trade) -> TradeEvidence:
+    async def get_evidence(self, trade: TradeRequest) -> TradeEvidence:
         symbols = tuple(sorted(leg.symbol for leg in trade.legs))
         cached = self._cache.get(symbols)
         if cached and monotonic() - cached[0] <= 1:
@@ -257,7 +262,7 @@ class DirectEvidenceProvider:
                 task = asyncio.create_task(self._fetch(symbols))
                 self._inflight[symbols] = task
 
-                def completed(done):
+                def completed(done: asyncio.Task[TradeEvidence]) -> None:
                     if self._inflight.get(symbols) is done:
                         self._inflight.pop(symbols, None)
                     if not done.cancelled():
@@ -290,7 +295,7 @@ class DirectEvidenceProvider:
             headers=self._headers, timeout=2, follow_redirects=False, transport=self._transport
         ) as client:
 
-            async def get(url, params=None):
+            async def get(url: str, params: dict[str, Any] | None = None) -> Any:
                 response = await client.get(url, params=params)
                 if response.status_code in {401, 403}:
                     raise EvidenceUnavailable("market_data_permission_denied")
